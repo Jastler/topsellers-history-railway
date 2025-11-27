@@ -1,0 +1,19 @@
+# Файли, які не потрібні на Railway
+.git
+.gitignore
+README.md
+RAILWAY_DEPLOY.md
+.env.example
+
+# Development
+nodemon.json
+.vscode
+.idea
+
+# Progress файли (створюються на сервері)
+progress_*.txt
+
+# Logs
+*.log
+npm-debug.log*
+

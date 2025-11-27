@@ -1,0 +1,46 @@
+# Залежності
+node_modules/
+package-lock.json
+yarn.lock
+
+# Файли середовища
+.env
+.env.local
+.env.*.local
+
+# Логи
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Кеш
+.cache
+.parcel-cache
+
+# Результати збірки
+dist/
+build/
+out/
+
+# IDE та редактори
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Тестування
+coverage/
+.nyc_output/
+
+# Тимчасові файли
+tmp/
+temp/
+*.tmp
+
+# Progress файли
+progress_*.txt
+
