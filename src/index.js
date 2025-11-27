@@ -262,7 +262,12 @@ async function main() {
   console.log(`Loaded ${appids.length} appids`);
   console.log("Resume from:", progress);
 
-  for (let i = progress.appIndex; i < appids.length; i++) {
+  const START_FROM = 60000; // <---- додано
+  const resumeIndex = Math.max(progress.appIndex, START_FROM);
+
+  console.log(`Starting from app index: ${resumeIndex}`);
+
+  for (let i = resumeIndex; i < appids.length; i++) {
     const appid = appids[i];
 
     try {
