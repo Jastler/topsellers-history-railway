@@ -24,8 +24,8 @@ const PROGRESS_FILE = "progress_wishlist.json";
 const BASE_DELAY_MS = 150;
 const MAX_BACKOFF_MS = 10 * 60 * 1000;
 
-// Kyiv 2025-11-26 12:00  → UTC 10:00 → unix = 1764151200
-const CUTOFF_TS = 1764151200;
+// Kyiv 2025-11-26 10:00  → UTC 8:00 → unix = 1764144000
+const CUTOFF_TS = 1764144000;
 
 // =====================================================
 // USER AGENTS
