@@ -19,20 +19,18 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE, {
 });
 
 const API_ROOT = "https://games-popularity.com/swagger/api/game/top-wishlist";
-
 const PROGRESS_FILE = "progress_wishlist.json";
 
 const BASE_DELAY_MS = 150;
 const MAX_BACKOFF_MS = 10 * 60 * 1000;
 
-// NEW CUTOFF: Kyiv 2025-11-26 12:00 => UTC 10:00
-// unix = 1764151200
+// Kyiv 2025-11-26 12:00  → UTC 10:00 → unix = 1764151200
 const CUTOFF_TS = 1764151200;
 
 // =====================================================
-// USER-AGENTS
+// USER AGENTS
 // =====================================================
-const USER_AGENTS = [
+const UA_POOL = [
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36",
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/123 Safari/537.36",
   "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/122 Safari/537.36",
@@ -43,16 +41,12 @@ const USER_AGENTS = [
   "Mozilla/5.0 (Linux; Android 14; Pixel 7 Pro) AppleWebKit/537.36 Chrome/122 Mobile Safari/537.36",
 ];
 
-function randomUA() {
-  return USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
-}
+const randomUA = () => UA_POOL[Math.floor(Math.random() * UA_POOL.length)];
 
 // =====================================================
 // HELPERS
 // =====================================================
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
-}
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function loadProgress() {
   if (!fs.existsSync(PROGRESS_FILE)) return { appIndex: 0, cursor: "0" };
@@ -67,13 +61,27 @@ function saveProgress(obj) {
   fs.writeFileSync(PROGRESS_FILE, JSON.stringify(obj, null, 2));
 }
 
-// FIX: партиції працюють тільки при FLOOR
+// Партиції — тільки floor!
 function roundTo5Minutes(unixTs) {
   return Math.floor(unixTs / 300) * 300;
 }
 
+// Видаляє дублікати в batch — повністю прибирає 42P10
+function dedupeRows(rows) {
+  const s = new Set();
+  const out = [];
+  for (const r of rows) {
+    const key = `${r.appid}-${r.ts}-${r.rank}`;
+    if (!s.has(key)) {
+      s.add(key);
+      out.push(r);
+    }
+  }
+  return out;
+}
+
 // =====================================================
-// NETWORK WITH ANTI-BAN + 404 SKIP
+// NETWORK WITH ANTI BAN
 // =====================================================
 async function fetchPageSafe(appid, cursor) {
   let attempt = 0;
@@ -83,15 +91,17 @@ async function fetchPageSafe(appid, cursor) {
 
     try {
       const url = `${API_ROOT}/${appid}?cursor=${encodeURIComponent(cursor)}`;
-      const ua = randomUA();
 
       const res = await fetch(url, {
-        headers: { "User-Agent": ua, accept: "*/*" },
+        headers: {
+          "User-Agent": randomUA(),
+          accept: "*/*",
+        },
       });
 
       if (res.ok) return await res.json();
 
-      // NO DATA → skip app
+      // 404 = нема wishlist історії
       if (res.status === 404) {
         if (attempt >= 2) {
           console.log(`[404] App ${appid}. Skip.`);
@@ -102,7 +112,7 @@ async function fetchPageSafe(appid, cursor) {
         continue;
       }
 
-      // BAN
+      // бан
       if (res.status === 429) {
         const wait = Math.min(60000 * attempt, MAX_BACKOFF_MS);
         console.log(`[BAN] 429 for ${appid}. Wait ${wait / 1000}s`);
@@ -112,7 +122,7 @@ async function fetchPageSafe(appid, cursor) {
 
       if (res.status >= 500) {
         const wait = Math.min(5000 * attempt, 120000);
-        console.log(`[SERVER] ${res.status}. Wait ${wait / 1000}s`);
+        console.log(`[SERVER ${res.status}] wait ${wait / 1000}s`);
         await sleep(wait);
         continue;
       }
@@ -121,7 +131,7 @@ async function fetchPageSafe(appid, cursor) {
     } catch (err) {
       const wait = Math.min(3000 * attempt, 120000);
       console.log(
-        `[NET] ${err.message} for ${appid}, cursor=${cursor}. Retry ${
+        `[NET] ${err.message} for ${appid}, cursor=${cursor}, retry ${
           wait / 1000
         }s`
       );
@@ -153,11 +163,16 @@ async function insertRows(appid, items) {
 
   if (!rows.length) return;
 
-  const { error } = await supabase.from("steam_wishlist_history").upsert(rows, {
-    onConflict: "appid,ts,rank",
-    ignoreDuplicates: true,
-    returning: "minimal",
-  });
+  // FIX: remove duplicates inside the batch → removes cause of 42P10
+  const cleanRows = dedupeRows(rows);
+
+  const { error } = await supabase
+    .from("steam_wishlist_history")
+    .upsert(cleanRows, {
+      onConflict: "appid,ts,rank",
+      ignoreDuplicates: true,
+      returning: "minimal",
+    });
 
   if (error) console.error("UPSERT error:", error);
 }
@@ -166,36 +181,36 @@ async function insertRows(appid, items) {
 // LOAD ALL APP IDS
 // =====================================================
 async function loadAllAppIds() {
-  let all = [];
+  let out = [];
   let from = 0;
-  const pageSize = 1000;
+  const size = 1000;
 
   while (true) {
     const { data, error } = await supabase
       .schema("public")
       .from("steam_app_details")
       .select("appid")
-      .range(from, from + pageSize - 1);
+      .range(from, from + size - 1);
 
     if (error) {
       console.error("Error loading appids:", error);
       process.exit(1);
     }
 
-    all.push(...data);
+    out.push(...data);
 
-    if (data.length < pageSize) break;
-    from += pageSize;
+    if (data.length < size) break;
+    from += size;
   }
 
-  return all.map((r) => r.appid);
+  return out.map((x) => x.appid);
 }
 
 // =====================================================
 // PROCESS ONE APP
 // =====================================================
-async function processApp(appid, startCursor, appIndex, totalApps) {
-  console.log(`\n=== APP ${appid} (${appIndex + 1}/${totalApps}) ===`);
+async function processApp(appid, startCursor, index, total) {
+  console.log(`\n=== APP ${appid} (${index + 1}/${total}) ===`);
 
   let cursor = startCursor;
   let pages = 0;
@@ -213,7 +228,7 @@ async function processApp(appid, startCursor, appIndex, totalApps) {
     }
 
     pages++;
-    saveProgress({ appIndex, cursor });
+    saveProgress({ appIndex: index, cursor });
 
     if (!data.nextCursor) {
       console.log(`Done app ${appid}, pages=${pages}`);
@@ -235,14 +250,11 @@ async function main() {
   console.log(`Loaded ${appids.length} appids`);
   console.log("Resume:", progress);
 
-  const resumeIndex = progress.appIndex;
-
-  for (let i = resumeIndex; i < appids.length; i++) {
+  for (let i = progress.appIndex; i < appids.length; i++) {
     const appid = appids[i];
 
     try {
       await processApp(appid, progress.cursor, i, appids.length);
-
       saveProgress({ appIndex: i + 1, cursor: "0" });
     } catch (err) {
       console.error(`App ${appid} crashed: ${err.message}`);
