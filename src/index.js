@@ -67,8 +67,9 @@ function saveProgress(obj) {
   fs.writeFileSync(PROGRESS_FILE, JSON.stringify(obj, null, 2));
 }
 
+// FIX: партиції працюють тільки при FLOOR
 function roundTo5Minutes(unixTs) {
-  return Math.ceil(unixTs / 300) * 300;
+  return Math.floor(unixTs / 300) * 300;
 }
 
 // =====================================================
@@ -234,7 +235,6 @@ async function main() {
   console.log(`Loaded ${appids.length} appids`);
   console.log("Resume:", progress);
 
-  // ALWAYS START FROM ZERO FOR WISHLIST
   const resumeIndex = progress.appIndex;
 
   for (let i = resumeIndex; i < appids.length; i++) {
