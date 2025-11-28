@@ -18,36 +18,29 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE, {
   db: { schema: "analytics" },
 });
 
-const API_ROOT = "https://games-popularity.com/swagger/api/game/top-sellers";
+const API_ROOT = "https://games-popularity.com/swagger/api/game/top-wishlist";
 
-const PROGRESS_FILE = "progress.json";
+const PROGRESS_FILE = "progress_wishlist.json";
 
 const BASE_DELAY_MS = 150;
 const MAX_BACKOFF_MS = 10 * 60 * 1000;
 
-// CUTOFF: Kyiv 2025-11-21 16:15 => UTC: 14:15
-// unix = 1763734500
-const CUTOFF_TS = 1763734500;
+// NEW CUTOFF: Kyiv 2025-11-26 12:00 => UTC 10:00
+// unix = 1764151200
+const CUTOFF_TS = 1764151200;
 
 // =====================================================
 // USER-AGENTS
 // =====================================================
 const USER_AGENTS = [
-  // Chrome
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36",
-  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/123.0 Safari/537.36",
-  "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/122.0 Safari/537.36",
-
-  // Firefox
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123.0) Gecko/20100101 Firefox/123.0",
-  "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:122.0) Gecko/20100101 Firefox/122.0",
-
-  // Safari
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36",
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/123 Safari/537.36",
+  "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/122 Safari/537.36",
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123) Gecko/20100101 Firefox/123.0",
+  "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:122) Gecko/20100101 Firefox/122.0",
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_2) AppleWebKit/605.1.15 Version/16.2 Safari/605.1.15",
-
-  // Mobile
   "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 Version/17.0 Mobile Safari/604.1",
-  "Mozilla/5.0 (Linux; Android 14; Pixel 7 Pro) AppleWebKit/537.36 Chrome/122.0 Mobile Safari/537.36",
+  "Mozilla/5.0 (Linux; Android 14; Pixel 7 Pro) AppleWebKit/537.36 Chrome/122 Mobile Safari/537.36",
 ];
 
 function randomUA() {
@@ -62,10 +55,7 @@ function sleep(ms) {
 }
 
 function loadProgress() {
-  if (!fs.existsSync(PROGRESS_FILE)) {
-    return { appIndex: 0, cursor: "0" };
-  }
-
+  if (!fs.existsSync(PROGRESS_FILE)) return { appIndex: 0, cursor: "0" };
   try {
     return JSON.parse(fs.readFileSync(PROGRESS_FILE, "utf8"));
   } catch {
@@ -82,7 +72,7 @@ function roundTo5Minutes(unixTs) {
 }
 
 // =====================================================
-// NETWORK WITH ANTI-BAN + 404-SKIP
+// NETWORK WITH ANTI-BAN + 404 SKIP
 // =====================================================
 async function fetchPageSafe(appid, cursor) {
   let attempt = 0;
@@ -95,26 +85,18 @@ async function fetchPageSafe(appid, cursor) {
       const ua = randomUA();
 
       const res = await fetch(url, {
-        headers: {
-          "User-Agent": ua,
-          accept: "*/*",
-        },
+        headers: { "User-Agent": ua, accept: "*/*" },
       });
 
-      // OK
       if (res.ok) return await res.json();
 
-      // PERMANENT NO-DATA CASE → skip app
+      // NO DATA → skip app
       if (res.status === 404) {
         if (attempt >= 2) {
-          console.log(
-            `[404] App ${appid}, cursor=${cursor}. No data → SKIP app.`
-          );
+          console.log(`[404] App ${appid}. Skip.`);
           return { history: [], nextCursor: null, _skipApp: true };
         }
-        console.log(
-          `[404] for ${appid}. Retrying once to confirm missing data...`
-        );
+        console.log(`[404] verify ${appid}...`);
         await sleep(2000);
         continue;
       }
@@ -122,22 +104,14 @@ async function fetchPageSafe(appid, cursor) {
       // BAN
       if (res.status === 429) {
         const wait = Math.min(60000 * attempt, MAX_BACKOFF_MS);
-        console.log(
-          `[BAN] 429 for ${appid}. Wait ${wait / 1000}s (UA: ${ua.slice(
-            0,
-            30
-          )}...)`
-        );
+        console.log(`[BAN] 429 for ${appid}. Wait ${wait / 1000}s`);
         await sleep(wait);
         continue;
       }
 
-      // SERVER ERROR
       if (res.status >= 500) {
         const wait = Math.min(5000 * attempt, 120000);
-        console.log(
-          `[SERVER] ${res.status} for ${appid}. Wait ${wait / 1000}s`
-        );
+        console.log(`[SERVER] ${res.status}. Wait ${wait / 1000}s`);
         await sleep(wait);
         continue;
       }
@@ -156,7 +130,7 @@ async function fetchPageSafe(appid, cursor) {
 }
 
 // =====================================================
-// UPSERT ROWS (with CUTOFF)
+// UPSERT ROWS
 // =====================================================
 async function insertRows(appid, items) {
   if (!items || !items.length) return;
@@ -178,19 +152,17 @@ async function insertRows(appid, items) {
 
   if (!rows.length) return;
 
-  const { error } = await supabase
-    .from("steam_topsellers_history")
-    .upsert(rows, {
-      onConflict: "appid,ts,rank",
-      ignoreDuplicates: true,
-      returning: "minimal",
-    });
+  const { error } = await supabase.from("steam_wishlist_history").upsert(rows, {
+    onConflict: "appid,ts,rank",
+    ignoreDuplicates: true,
+    returning: "minimal",
+  });
 
   if (error) console.error("UPSERT error:", error);
 }
 
 // =====================================================
-// LOAD APP IDS (pagination)
+// LOAD ALL APP IDS
 // =====================================================
 async function loadAllAppIds() {
   let all = [];
@@ -210,8 +182,8 @@ async function loadAllAppIds() {
     }
 
     all.push(...data);
-    if (data.length < pageSize) break;
 
+    if (data.length < pageSize) break;
     from += pageSize;
   }
 
@@ -219,7 +191,7 @@ async function loadAllAppIds() {
 }
 
 // =====================================================
-// PROCESS EACH APP
+// PROCESS ONE APP
 // =====================================================
 async function processApp(appid, startCursor, appIndex, totalApps) {
   console.log(`\n=== APP ${appid} (${appIndex + 1}/${totalApps}) ===`);
@@ -231,7 +203,7 @@ async function processApp(appid, startCursor, appIndex, totalApps) {
     const data = await fetchPageSafe(appid, cursor);
 
     if (data._skipApp) {
-      console.log(`Skipping app ${appid} — no historical data.`);
+      console.log(`Skip app ${appid}. No wishlist history.`);
       return;
     }
 
@@ -243,7 +215,7 @@ async function processApp(appid, startCursor, appIndex, totalApps) {
     saveProgress({ appIndex, cursor });
 
     if (!data.nextCursor) {
-      console.log(`Done app ${appid}, pages: ${pages}`);
+      console.log(`Done app ${appid}, pages=${pages}`);
       return;
     }
 
@@ -260,12 +232,10 @@ async function main() {
   const progress = loadProgress();
 
   console.log(`Loaded ${appids.length} appids`);
-  console.log("Resume from:", progress);
+  console.log("Resume:", progress);
 
-  const START_FROM = 60000; // <---- додано
-  const resumeIndex = Math.max(progress.appIndex, START_FROM);
-
-  console.log(`Starting from app index: ${resumeIndex}`);
+  // ALWAYS START FROM ZERO FOR WISHLIST
+  const resumeIndex = progress.appIndex;
 
   for (let i = resumeIndex; i < appids.length; i++) {
     const appid = appids[i];
