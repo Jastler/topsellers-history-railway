@@ -263,7 +263,7 @@ async function main() {
     }
   }
 
-  console.log("\n=== ALL DONE ===");
+  console.log("\nALL DONE");
   saveProgress({ appIndex: appids.length, cursor: "0" });
 }
 
