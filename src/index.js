@@ -9,23 +9,19 @@ const SUPABASE_URL = "https://psztbppcuwnrbiguicdn.supabase.co";
 const SUPABASE_SERVICE_ROLE =
   "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBzenRicHBjdXducmJpZ3VpY2RuIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc2Mjg1OTA4MiwiZXhwIjoyMDc4NDM1MDgyfQ.dl_mOJeJzvmaip_hr6LlyApMo5kzEXQklCE_ZNmhuWw";
 
-if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE) {
-  console.error("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE");
-  process.exit(1);
-}
-
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE, {
   db: { schema: "analytics" },
 });
 
-const API_ROOT = "https://games-popularity.com/swagger/api/game/top-wishlist";
-const PROGRESS_FILE = "progress_wishlist.json";
+const API_ROOT = "https://games-popularity.com/swagger/api/game/followers";
+
+const PROGRESS_FILE = "progress_followers.json";
 
 const BASE_DELAY_MS = 150;
 const MAX_BACKOFF_MS = 10 * 60 * 1000;
 
-// Kyiv 2025-11-26 10:00  → UTC 8:00 → unix = 1764144000
-const CUTOFF_TS = 1764144000;
+// Твій час-фільтр
+const CUTOFF_TS = 1764657074;
 
 // =====================================================
 // USER AGENTS
@@ -61,19 +57,18 @@ function saveProgress(obj) {
   fs.writeFileSync(PROGRESS_FILE, JSON.stringify(obj, null, 2));
 }
 
-// Партиції — тільки floor!
-function roundTo5Minutes(unixTs) {
-  return Math.floor(unixTs / 300) * 300;
+// Округлення до п'ятихвилинки
+function roundTo5Minutes(unix) {
+  return Math.floor(unix / 300) * 300;
 }
 
-// Видаляє дублікати в batch — повністю прибирає 42P10
 function dedupeRows(rows) {
-  const s = new Set();
+  const seen = new Set();
   const out = [];
   for (const r of rows) {
-    const key = `${r.appid}-${r.ts}-${r.rank}`;
-    if (!s.has(key)) {
-      s.add(key);
+    const key = `${r.appid}-${r.ts}`;
+    if (!seen.has(key)) {
+      seen.add(key);
       out.push(r);
     }
   }
@@ -81,7 +76,7 @@ function dedupeRows(rows) {
 }
 
 // =====================================================
-// NETWORK WITH ANTI BAN
+// NETWORK (ANTI-BAN)
 // =====================================================
 async function fetchPageSafe(appid, cursor) {
   let attempt = 0;
@@ -95,45 +90,41 @@ async function fetchPageSafe(appid, cursor) {
       const res = await fetch(url, {
         headers: {
           "User-Agent": randomUA(),
-          accept: "*/*",
+          Accept: "*/*",
         },
       });
 
       if (res.ok) return await res.json();
 
-      // 404 = нема wishlist історії
       if (res.status === 404) {
         if (attempt >= 2) {
-          console.log(`[404] App ${appid}. Skip.`);
+          console.log(`[404] App ${appid} — no followers history`);
           return { history: [], nextCursor: null, _skipApp: true };
         }
-        console.log(`[404] verify ${appid}...`);
+        console.log(`[404] Verifying ${appid} again...`);
         await sleep(2000);
         continue;
       }
 
-      // бан
       if (res.status === 429) {
-        const wait = Math.min(60000 * attempt, MAX_BACKOFF_MS);
-        console.log(`[BAN] 429 for ${appid}. Wait ${wait / 1000}s`);
+        const wait = Math.min(attempt * 60000, MAX_BACKOFF_MS);
+        console.log(`[BAN 429] waiting ${wait / 1000}s`);
         await sleep(wait);
         continue;
       }
 
       if (res.status >= 500) {
-        const wait = Math.min(5000 * attempt, 120000);
-        console.log(`[SERVER ${res.status}] wait ${wait / 1000}s`);
+        const wait = Math.min(attempt * 5000, 120000);
+        console.log(`[SERVER ${res.status}] retry in ${wait / 1000}s`);
         await sleep(wait);
         continue;
       }
 
       throw new Error(`HTTP ${res.status}`);
     } catch (err) {
-      const wait = Math.min(3000 * attempt, 120000);
+      const wait = Math.min(attempt * 3000, 120000);
       console.log(
-        `[NET] ${err.message} for ${appid}, cursor=${cursor}, retry ${
-          wait / 1000
-        }s`
+        `[NET ERR] ${err.message} for ${appid}, retry in ${wait / 1000}s`
       );
       await sleep(wait);
     }
@@ -141,9 +132,9 @@ async function fetchPageSafe(appid, cursor) {
 }
 
 // =====================================================
-// UPSERT ROWS
+// UPSERT FOLLOWERS HISTORY
 // =====================================================
-async function insertRows(appid, items) {
+async function insertFollowerRows(appid, items) {
   if (!items || !items.length) return;
 
   const rows = [];
@@ -152,33 +143,33 @@ async function insertRows(appid, items) {
     const tsOrig = Math.floor(new Date(h.added).getTime() / 1000);
     const tsRounded = roundTo5Minutes(tsOrig);
 
+    // Відсікаємо новіші записи
     if (tsRounded >= CUTOFF_TS) continue;
 
     rows.push({
       appid: Number(appid),
-      rank: h.position,
+      followers: h.followers,
       ts: tsRounded,
     });
   }
 
   if (!rows.length) return;
 
-  // FIX: remove duplicates inside the batch → removes cause of 42P10
-  const cleanRows = dedupeRows(rows);
+  const clean = dedupeRows(rows);
 
   const { error } = await supabase
-    .from("steam_wishlist_history")
-    .upsert(cleanRows, {
-      onConflict: "appid,ts,rank",
+    .from("steam_followers_history")
+    .upsert(clean, {
+      onConflict: "appid,ts",
       ignoreDuplicates: true,
       returning: "minimal",
     });
 
-  if (error) console.error("UPSERT error:", error);
+  if (error) console.error("UPSERT followers error:", error);
 }
 
 // =====================================================
-// LOAD ALL APP IDS
+// LOAD ALL APPIDS
 // =====================================================
 async function loadAllAppIds() {
   let out = [];
@@ -190,6 +181,7 @@ async function loadAllAppIds() {
       .schema("public")
       .from("steam_app_details")
       .select("appid")
+      .order("appid", { ascending: true })
       .range(from, from + size - 1);
 
     if (error) {
@@ -219,19 +211,19 @@ async function processApp(appid, startCursor, index, total) {
     const data = await fetchPageSafe(appid, cursor);
 
     if (data._skipApp) {
-      console.log(`Skip app ${appid}. No wishlist history.`);
+      console.log(`No followers history for ${appid}`);
       return;
     }
 
     if (Array.isArray(data.history) && data.history.length > 0) {
-      await insertRows(appid, data.history);
+      await insertFollowerRows(appid, data.history);
     }
 
     pages++;
     saveProgress({ appIndex: index, cursor });
 
     if (!data.nextCursor) {
-      console.log(`Done app ${appid}, pages=${pages}`);
+      console.log(`Done ${appid}, pages=${pages}`);
       return;
     }
 
@@ -263,7 +255,7 @@ async function main() {
     }
   }
 
-  console.log("\nALL DONE");
+  console.log("\nALL FOLLOWERS IMPORTED");
   saveProgress({ appIndex: appids.length, cursor: "0" });
 }
 
