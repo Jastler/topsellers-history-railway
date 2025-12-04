@@ -13,15 +13,17 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE, {
   db: { schema: "analytics" },
 });
 
-const API_ROOT = "https://games-popularity.com/swagger/api/game/followers";
+// Reviews API
+const API_ROOT = "https://games-popularity.com/swagger/api/game/reviews";
 
-const PROGRESS_FILE = "progress_followers.json";
+// Прогрес (резюм)
+const PROGRESS_FILE = "progress_reviews.json";
+
+// Ти поставиш свою межу
+const CUTOFF_TS = 1764779400; // не вставляємо новіші TS
 
 const BASE_DELAY_MS = 150;
 const MAX_BACKOFF_MS = 10 * 60 * 1000;
-
-// Твій час-фільтр
-const CUTOFF_TS = 1764657074;
 
 // =====================================================
 // USER AGENTS
@@ -39,11 +41,11 @@ const UA_POOL = [
 
 const randomUA = () => UA_POOL[Math.floor(Math.random() * UA_POOL.length)];
 
-// =====================================================
-// HELPERS
-// =====================================================
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// =====================================================
+// PROGRESS
+// =====================================================
 function loadProgress() {
   if (!fs.existsSync(PROGRESS_FILE)) return { appIndex: 0, cursor: "0" };
   try {
@@ -57,7 +59,9 @@ function saveProgress(obj) {
   fs.writeFileSync(PROGRESS_FILE, JSON.stringify(obj, null, 2));
 }
 
-// Округлення до п'ятихвилинки
+// =====================================================
+// HELPERS
+// =====================================================
 function roundTo5Minutes(unix) {
   return Math.floor(unix / 300) * 300;
 }
@@ -65,6 +69,7 @@ function roundTo5Minutes(unix) {
 function dedupeRows(rows) {
   const seen = new Set();
   const out = [];
+
   for (const r of rows) {
     const key = `${r.appid}-${r.ts}`;
     if (!seen.has(key)) {
@@ -72,18 +77,18 @@ function dedupeRows(rows) {
       out.push(r);
     }
   }
+
   return out;
 }
 
 // =====================================================
-// NETWORK (ANTI-BAN)
+// NETWORK (ANTIBAN)
 // =====================================================
 async function fetchPageSafe(appid, cursor) {
   let attempt = 0;
 
   while (true) {
     attempt++;
-
     try {
       const url = `${API_ROOT}/${appid}?cursor=${encodeURIComponent(cursor)}`;
 
@@ -94,21 +99,23 @@ async function fetchPageSafe(appid, cursor) {
         },
       });
 
-      if (res.ok) return await res.json();
+      if (res.ok) {
+        return await res.json();
+      }
 
       if (res.status === 404) {
         if (attempt >= 2) {
-          console.log(`[404] App ${appid} — no followers history`);
+          console.log(`[404] App ${appid} — no reviews history`);
           return { history: [], nextCursor: null, _skipApp: true };
         }
-        console.log(`[404] Verifying ${appid} again...`);
+        console.log(`[404] Retrying ${appid}...`);
         await sleep(2000);
         continue;
       }
 
       if (res.status === 429) {
         const wait = Math.min(attempt * 60000, MAX_BACKOFF_MS);
-        console.log(`[BAN 429] waiting ${wait / 1000}s`);
+        console.log(`[BAN 429] wait ${wait / 1000}s`);
         await sleep(wait);
         continue;
       }
@@ -123,19 +130,17 @@ async function fetchPageSafe(appid, cursor) {
       throw new Error(`HTTP ${res.status}`);
     } catch (err) {
       const wait = Math.min(attempt * 3000, 120000);
-      console.log(
-        `[NET ERR] ${err.message} for ${appid}, retry in ${wait / 1000}s`
-      );
+      console.log(`[NET ERR] ${err.message} | retry ${wait / 1000}s`);
       await sleep(wait);
     }
   }
 }
 
 // =====================================================
-// UPSERT FOLLOWERS HISTORY
+// UPSERT REVIEWS HISTORY
 // =====================================================
-async function insertFollowerRows(appid, items) {
-  if (!items || !items.length) return;
+async function insertReviewRows(appid, items) {
+  if (!items?.length) return;
 
   const rows = [];
 
@@ -143,13 +148,13 @@ async function insertFollowerRows(appid, items) {
     const tsOrig = Math.floor(new Date(h.added).getTime() / 1000);
     const tsRounded = roundTo5Minutes(tsOrig);
 
-    // Відсікаємо новіші записи
     if (tsRounded >= CUTOFF_TS) continue;
 
     rows.push({
       appid: Number(appid),
-      followers: h.followers,
       ts: tsRounded,
+      total_reviews: h.reviewsAll,
+      total_positive: h.reviewsPositive,
     });
   }
 
@@ -157,15 +162,13 @@ async function insertFollowerRows(appid, items) {
 
   const clean = dedupeRows(rows);
 
-  const { error } = await supabase
-    .from("steam_followers_history")
-    .upsert(clean, {
-      onConflict: "appid,ts",
-      ignoreDuplicates: true,
-      returning: "minimal",
-    });
+  const { error } = await supabase.from("steam_reviews_history").upsert(clean, {
+    onConflict: "appid,ts",
+    ignoreDuplicates: true,
+    returning: "minimal",
+  });
 
-  if (error) console.error("UPSERT followers error:", error);
+  if (error) console.error("UPSERT reviews error:", error);
 }
 
 // =====================================================
@@ -190,7 +193,6 @@ async function loadAllAppIds() {
     }
 
     out.push(...data);
-
     if (data.length < size) break;
     from += size;
   }
@@ -199,7 +201,7 @@ async function loadAllAppIds() {
 }
 
 // =====================================================
-// PROCESS ONE APP
+// PROCESS 1 APP
 // =====================================================
 async function processApp(appid, startCursor, index, total) {
   console.log(`\n=== APP ${appid} (${index + 1}/${total}) ===`);
@@ -211,12 +213,12 @@ async function processApp(appid, startCursor, index, total) {
     const data = await fetchPageSafe(appid, cursor);
 
     if (data._skipApp) {
-      console.log(`No followers history for ${appid}`);
+      console.log(`Skip ${appid} — no reviews`);
       return;
     }
 
     if (Array.isArray(data.history) && data.history.length > 0) {
-      await insertFollowerRows(appid, data.history);
+      await insertReviewRows(appid, data.history);
     }
 
     pages++;
@@ -240,7 +242,7 @@ async function main() {
   const progress = loadProgress();
 
   console.log(`Loaded ${appids.length} appids`);
-  console.log("Resume:", progress);
+  console.log("Resume from:", progress);
 
   for (let i = progress.appIndex; i < appids.length; i++) {
     const appid = appids[i];
@@ -255,7 +257,7 @@ async function main() {
     }
   }
 
-  console.log("\nALL FOLLOWERS IMPORTED");
+  console.log("\nALL REVIEWS IMPORTED");
   saveProgress({ appIndex: appids.length, cursor: "0" });
 }
 
