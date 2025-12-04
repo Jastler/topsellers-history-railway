@@ -3,6 +3,11 @@ import fs from "fs";
 import { createClient } from "@supabase/supabase-js";
 
 // =====================================================
+// FORCED START INDEX (set number or null)
+// =====================================================
+const START_INDEX = 74150; // <<< ПОЧАТИ З ЦЬОГО ІНДЕКСУ. АБО null ДЛЯ РЕЗЮМУ
+
+// =====================================================
 // CONFIG
 // =====================================================
 const SUPABASE_URL = "https://psztbppcuwnrbiguicdn.supabase.co";
@@ -16,12 +21,13 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE, {
 // Reviews API
 const API_ROOT = "https://games-popularity.com/swagger/api/game/reviews";
 
-// Прогрес (резюм)
+// Прогрес
 const PROGRESS_FILE = "progress_reviews.json";
 
-// Ти поставиш свою межу
-const CUTOFF_TS = 1764779400; // не вставляємо новіші TS
+// Відсікти нові записи
+const CUTOFF_TS = 1764779400;
 
+// Speed limits
 const BASE_DELAY_MS = 150;
 const MAX_BACKOFF_MS = 10 * 60 * 1000;
 
@@ -99,30 +105,28 @@ async function fetchPageSafe(appid, cursor) {
         },
       });
 
-      if (res.ok) {
-        return await res.json();
-      }
+      if (res.ok) return await res.json();
 
       if (res.status === 404) {
         if (attempt >= 2) {
           console.log(`[404] App ${appid} — no reviews history`);
           return { history: [], nextCursor: null, _skipApp: true };
         }
-        console.log(`[404] Retrying ${appid}...`);
+        console.log(`[404] retry ${appid}`);
         await sleep(2000);
         continue;
       }
 
       if (res.status === 429) {
         const wait = Math.min(attempt * 60000, MAX_BACKOFF_MS);
-        console.log(`[BAN 429] wait ${wait / 1000}s`);
+        console.log(`[429 BAN] wait ${wait / 1000}s`);
         await sleep(wait);
         continue;
       }
 
       if (res.status >= 500) {
         const wait = Math.min(attempt * 5000, 120000);
-        console.log(`[SERVER ${res.status}] retry in ${wait / 1000}s`);
+        console.log(`[SERVER ${res.status}] retry ${wait / 1000}s`);
         await sleep(wait);
         continue;
       }
@@ -130,7 +134,7 @@ async function fetchPageSafe(appid, cursor) {
       throw new Error(`HTTP ${res.status}`);
     } catch (err) {
       const wait = Math.min(attempt * 3000, 120000);
-      console.log(`[NET ERR] ${err.message} | retry ${wait / 1000}s`);
+      console.log(`[NET ERR] ${err.message} retry ${wait / 1000}s`);
       await sleep(wait);
     }
   }
@@ -184,16 +188,17 @@ async function loadAllAppIds() {
       .schema("public")
       .from("steam_app_details")
       .select("appid")
-      .order("appid", { ascending: true })
+      .order("appid")
       .range(from, from + size - 1);
 
     if (error) {
-      console.error("Error loading appids:", error);
+      console.error(error);
       process.exit(1);
     }
 
     out.push(...data);
     if (data.length < size) break;
+
     from += size;
   }
 
@@ -201,7 +206,7 @@ async function loadAllAppIds() {
 }
 
 // =====================================================
-// PROCESS 1 APP
+// PROCESS ONE APP
 // =====================================================
 async function processApp(appid, startCursor, index, total) {
   console.log(`\n=== APP ${appid} (${index + 1}/${total}) ===`);
@@ -213,19 +218,19 @@ async function processApp(appid, startCursor, index, total) {
     const data = await fetchPageSafe(appid, cursor);
 
     if (data._skipApp) {
-      console.log(`Skip ${appid} — no reviews`);
+      console.log(`Skip ${appid}`);
       return;
     }
 
-    if (Array.isArray(data.history) && data.history.length > 0) {
+    if (data.history?.length) {
       await insertReviewRows(appid, data.history);
     }
 
-    pages++;
     saveProgress({ appIndex: index, cursor });
+    pages++;
 
     if (!data.nextCursor) {
-      console.log(`Done ${appid}, pages=${pages}`);
+      console.log(`Done ${appid} pages=${pages}`);
       return;
     }
 
@@ -241,18 +246,22 @@ async function main() {
   const appids = await loadAllAppIds();
   const progress = loadProgress();
 
-  console.log(`Loaded ${appids.length} appids`);
-  console.log("Resume from:", progress);
+  const startIndex = START_INDEX !== null ? START_INDEX : progress.appIndex;
 
-  for (let i = progress.appIndex; i < appids.length; i++) {
+  const startCursor = START_INDEX !== null ? "0" : progress.cursor;
+
+  console.log(`Loaded ${appids.length} appids`);
+  console.log(`Resume from appIndex=${startIndex}, cursor=${startCursor}`);
+
+  for (let i = startIndex; i < appids.length; i++) {
     const appid = appids[i];
 
     try {
-      await processApp(appid, progress.cursor, i, appids.length);
+      await processApp(appid, startCursor, i, appids.length);
       saveProgress({ appIndex: i + 1, cursor: "0" });
     } catch (err) {
       console.error(`App ${appid} crashed: ${err.message}`);
-      console.error("Safe exit. Restart to resume.");
+      console.error("Safe exit.");
       process.exit(1);
     }
   }
