@@ -3,61 +3,62 @@ import fs from "fs";
 import { createClient } from "@supabase/supabase-js";
 
 // =====================================================
-// FORCED START INDEX (set number or null)
-// =====================================================
-const START_INDEX = 74150; // <<< ПОЧАТИ З ЦЬОГО ІНДЕКСУ. АБО null ДЛЯ РЕЗЮМУ
-
-// =====================================================
 // CONFIG
 // =====================================================
 const SUPABASE_URL = "https://psztbppcuwnrbiguicdn.supabase.co";
 const SUPABASE_SERVICE_ROLE =
   "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBzenRicHBjdXducmJpZ3VpY2RuIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc2Mjg1OTA4MiwiZXhwIjoyMDc4NDM1MDgyfQ.dl_mOJeJzvmaip_hr6LlyApMo5kzEXQklCE_ZNmhuWw";
 
-const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE, {
+if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE) {
+  console.error("❌ SUPABASE_URL / SUPABASE_SERVICE_ROLE not set");
+  process.exit(1);
+}
+
+// analytics client (ціни)
+const supabaseAnalytics = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE, {
   db: { schema: "analytics" },
 });
 
-// Reviews API
-const API_ROOT = "https://games-popularity.com/swagger/api/game/reviews";
+// public client (appid-список)
+const supabasePublic = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE, {
+  db: { schema: "public" },
+});
 
-// Прогрес
-const PROGRESS_FILE = "progress_reviews.json";
+// endpoint історії цін
+const API_ROOT = "https://games-popularity.com/swagger/api/game/price";
 
-// Відсікти нові записи
-const CUTOFF_TS = 1764779400;
+// файл прогресу
+const PROGRESS_FILE = "progress_price.json";
 
-// Speed limits
+// ✸ ВАЖЛИВО: беремо ТІЛЬКИ ЗАПИСИ СТАРІШІ, НІЖ CUTOFF
+//    вставляємо, якщо ts < CUTOFF_TS
+const CUTOFF_TS = 1765189200; // наприклад 2025-12-08 20:00:00 UTC
+
 const BASE_DELAY_MS = 150;
-const MAX_BACKOFF_MS = 10 * 60 * 1000;
 
 // =====================================================
-// USER AGENTS
+// UTILS
 // =====================================================
-const UA_POOL = [
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36",
-  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/123 Safari/537.36",
-  "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/122 Safari/537.36",
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123) Gecko/20100101 Firefox/123.0",
-  "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:122) Gecko/20100101 Firefox/122.0",
-  "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_2) AppleWebKit/605.1.15 Version/16.2 Safari/605.1.15",
-  "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 Version/17.0 Mobile Safari/604.1",
-  "Mozilla/5.0 (Linux; Android 14; Pixel 7 Pro) AppleWebKit/537.36 Chrome/122 Mobile Safari/537.36",
-];
-
-const randomUA = () => UA_POOL[Math.floor(Math.random() * UA_POOL.length)];
-
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// =====================================================
-// PROGRESS
-// =====================================================
+function roundTo5Minutes(unixSeconds) {
+  return Math.floor(unixSeconds / 300) * 300;
+}
+
+function dedupeRows(rows) {
+  const map = new Map();
+  for (const r of rows) {
+    map.set(`${r.appid}-${r.ts}`, r);
+  }
+  return [...map.values()];
+}
+
 function loadProgress() {
-  if (!fs.existsSync(PROGRESS_FILE)) return { appIndex: 0, cursor: "0" };
+  if (!fs.existsSync(PROGRESS_FILE)) return { index: 0, cursor: "0" };
   try {
     return JSON.parse(fs.readFileSync(PROGRESS_FILE, "utf8"));
   } catch {
-    return { appIndex: 0, cursor: "0" };
+    return { index: 0, cursor: "0" };
   }
 }
 
@@ -66,117 +67,152 @@ function saveProgress(obj) {
 }
 
 // =====================================================
-// HELPERS
+// FETCH PAGE
 // =====================================================
-function roundTo5Minutes(unix) {
-  return Math.floor(unix / 300) * 300;
-}
-
-function dedupeRows(rows) {
-  const seen = new Set();
-  const out = [];
-
-  for (const r of rows) {
-    const key = `${r.appid}-${r.ts}`;
-    if (!seen.has(key)) {
-      seen.add(key);
-      out.push(r);
-    }
-  }
-
-  return out;
-}
-
-// =====================================================
-// NETWORK (ANTIBAN)
-// =====================================================
-async function fetchPageSafe(appid, cursor) {
-  let attempt = 0;
+async function fetchPage(appid, cursor) {
+  const url = `${API_ROOT}/${appid}?cursor=${encodeURIComponent(cursor)}`;
 
   while (true) {
-    attempt++;
     try {
-      const url = `${API_ROOT}/${appid}?cursor=${encodeURIComponent(cursor)}`;
-
       const res = await fetch(url, {
         headers: {
-          "User-Agent": randomUA(),
+          "User-Agent": "Mozilla/5.0",
           Accept: "*/*",
         },
       });
 
-      if (res.ok) return await res.json();
-
       if (res.status === 404) {
-        if (attempt >= 2) {
-          console.log(`[404] App ${appid} — no reviews history`);
-          return { history: [], nextCursor: null, _skipApp: true };
-        }
-        console.log(`[404] retry ${appid}`);
-        await sleep(2000);
-        continue;
+        // немає історії
+        return { history: [], nextCursor: null, skip: true };
       }
 
       if (res.status === 429) {
-        const wait = Math.min(attempt * 60000, MAX_BACKOFF_MS);
-        console.log(`[429 BAN] wait ${wait / 1000}s`);
-        await sleep(wait);
+        console.log(`  ⚠ 429 Too Many Requests → wait 60s`);
+        await sleep(60000);
         continue;
       }
 
-      if (res.status >= 500) {
-        const wait = Math.min(attempt * 5000, 120000);
-        console.log(`[SERVER ${res.status}] retry ${wait / 1000}s`);
-        await sleep(wait);
+      if (!res.ok) {
+        console.log(`  ⚠ HTTP ${res.status} → retry 3s`);
+        await sleep(3000);
         continue;
       }
 
-      throw new Error(`HTTP ${res.status}`);
+      return await res.json();
     } catch (err) {
-      const wait = Math.min(attempt * 3000, 120000);
-      console.log(`[NET ERR] ${err.message} retry ${wait / 1000}s`);
-      await sleep(wait);
+      console.log(`  ⚠ NET ERROR: ${err.message} → retry 5s`);
+      await sleep(5000);
     }
   }
 }
 
 // =====================================================
-// UPSERT REVIEWS HISTORY
+// INSERT PRICE HISTORY (only earliest record per price block)
+// and ONLY ts < CUTOFF_TS
 // =====================================================
-async function insertReviewRows(appid, items) {
-  if (!items?.length) return;
+async function insertPriceRows(appid, items) {
+  if (!items?.length) return 0;
 
+  // історія з API йде "від нових до старих" → розвертаємо
+  const sorted = [...items].sort(
+    (a, b) => new Date(a.added).getTime() - new Date(b.added).getTime()
+  );
+
+  let lastPrice = null;
   const rows = [];
 
-  for (const h of items) {
-    const tsOrig = Math.floor(new Date(h.added).getTime() / 1000);
-    const tsRounded = roundTo5Minutes(tsOrig);
+  for (const h of sorted) {
+    const ts = Math.floor(new Date(h.added).getTime() / 1000);
 
-    if (tsRounded >= CUTOFF_TS) continue;
+    // 🔥 беремо тільки СТАРІШІ за CUTOFF
+    if (ts >= CUTOFF_TS) continue;
+
+    const priceCents = Math.round(h.price * 100);
+
+    // якщо ціна така ж як попередня → пропускаємо
+    if (priceCents === lastPrice) {
+      continue;
+    }
+    lastPrice = priceCents;
+
+    const tsRounded = roundTo5Minutes(ts);
 
     rows.push({
-      appid: Number(appid),
+      appid,
       ts: tsRounded,
-      total_reviews: h.reviewsAll,
-      total_positive: h.reviewsPositive,
+      price_currency: "USD", // у GP все в USD, ти потім можеш розширити
+      price_initial: priceCents,
+      price_final: priceCents,
+      price_discount: 0,
     });
   }
 
-  if (!rows.length) return;
+  const unique = dedupeRows(rows);
 
-  const clean = dedupeRows(rows);
+  console.log(
+    `  • history items=${items.length}, written_unique=${unique.length}`
+  );
 
-  const { error } = await supabase.from("steam_reviews_history").upsert(clean, {
-    onConflict: "appid,ts",
-    ignoreDuplicates: true,
-    returning: "minimal",
-  });
+  if (!unique.length) return 0;
 
-  if (error) console.error("UPSERT reviews error:", error);
+  const { error } = await supabaseAnalytics
+    .from("steam_price_history")
+    .upsert(unique, {
+      onConflict: "appid,ts",
+      returning: "minimal",
+    });
+
+  if (error) {
+    console.log(`  ⚠ UPSERT ERROR`, error);
+    return 0;
+  }
+
+  return unique.length;
 }
 
 // =====================================================
-// LOAD ALL APPIDS
+// PROCESS ONE APP
+// =====================================================
+async function processApp(appid, cursor, index, total) {
+  const start = Date.now();
+  const pct = (((index + 1) / total) * 100).toFixed(2);
+
+  console.log(`\n=== APP ${appid} (${index + 1}/${total}, ${pct}%) ===`);
+
+  let pages = 0;
+  let inserted = 0;
+
+  while (true) {
+    const data = await fetchPage(appid, cursor);
+    pages++;
+
+    if (data.skip) {
+      console.log(`  • No price history (404)`);
+      break;
+    }
+
+    if (data.history?.length) {
+      const added = await insertPriceRows(appid, data.history);
+      inserted += added;
+    }
+
+    if (!data.nextCursor) {
+      break;
+    }
+
+    cursor = data.nextCursor;
+    saveProgress({ index, cursor });
+    await sleep(BASE_DELAY_MS);
+  }
+
+  const sec = ((Date.now() - start) / 1000).toFixed(1);
+  console.log(
+    `✔ Done appid=${appid}, pages=${pages}, inserted=${inserted}, time=${sec}s`
+  );
+}
+
+// =====================================================
+// LOAD ALL APPIDS FROM public.steam_app_details
 // =====================================================
 async function loadAllAppIds() {
   let out = [];
@@ -184,19 +220,19 @@ async function loadAllAppIds() {
   const size = 1000;
 
   while (true) {
-    const { data, error } = await supabase
-      .schema("public")
+    const { data, error } = await supabasePublic
       .from("steam_app_details")
       .select("appid")
       .order("appid")
       .range(from, from + size - 1);
 
     if (error) {
-      console.error(error);
+      console.error("❌ Error load appids:", error);
       process.exit(1);
     }
 
     out.push(...data);
+    console.log(out.length);
     if (data.length < size) break;
 
     from += size;
@@ -206,68 +242,36 @@ async function loadAllAppIds() {
 }
 
 // =====================================================
-// PROCESS ONE APP
-// =====================================================
-async function processApp(appid, startCursor, index, total) {
-  console.log(`\n=== APP ${appid} (${index + 1}/${total}) ===`);
-
-  let cursor = startCursor;
-  let pages = 0;
-
-  while (true) {
-    const data = await fetchPageSafe(appid, cursor);
-
-    if (data._skipApp) {
-      console.log(`Skip ${appid}`);
-      return;
-    }
-
-    if (data.history?.length) {
-      await insertReviewRows(appid, data.history);
-    }
-
-    saveProgress({ appIndex: index, cursor });
-    pages++;
-
-    if (!data.nextCursor) {
-      console.log(`Done ${appid} pages=${pages}`);
-      return;
-    }
-
-    cursor = data.nextCursor;
-    await sleep(BASE_DELAY_MS);
-  }
-}
-
-// =====================================================
 // MAIN
 // =====================================================
 async function main() {
   const appids = await loadAllAppIds();
   const progress = loadProgress();
 
-  const startIndex = START_INDEX !== null ? START_INDEX : progress.appIndex;
-
-  const startCursor = START_INDEX !== null ? "0" : progress.cursor;
+  let startIndex = progress.index ?? 0;
+  let cursor = progress.cursor ?? "0";
 
   console.log(`Loaded ${appids.length} appids`);
-  console.log(`Resume from appIndex=${startIndex}, cursor=${startCursor}`);
+  console.log(`Resume from index=${startIndex}, cursor=${cursor}`);
+  console.log(`CUTOFF_TS=${CUTOFF_TS} (ts >= CUTOFF → SKIP)`);
 
   for (let i = startIndex; i < appids.length; i++) {
     const appid = appids[i];
 
     try {
-      await processApp(appid, startCursor, i, appids.length);
-      saveProgress({ appIndex: i + 1, cursor: "0" });
+      await processApp(appid, cursor, i, appids.length);
+      // після успішного app — переходимо до наступного, курсор скидаємо
+      saveProgress({ index: i + 1, cursor: "0" });
+      cursor = "0";
     } catch (err) {
-      console.error(`App ${appid} crashed: ${err.message}`);
-      console.error("Safe exit.");
+      console.error(`❌ App ${appid} crashed:`, err);
+      console.error("Safe exit — you can restart later.");
       process.exit(1);
     }
   }
 
-  console.log("\nALL REVIEWS IMPORTED");
-  saveProgress({ appIndex: appids.length, cursor: "0" });
+  console.log("\n=== ALL PRICE HISTORY IMPORTED (OLD DATA) ===");
+  saveProgress({ index: appids.length, cursor: "0" });
 }
 
 main();
