@@ -22,7 +22,7 @@ const API_ROOT = "https://games-popularity.com/swagger/api/game/players";
 const PROGRESS_FILE = "ccu_progress.json";
 
 const CUTOFF_TS = 1765422000; // не беремо новіші
-const FORWARD_WINDOW = 2 * 3600; // 2 годин уперед
+const FORWARD_WINDOW = 5 * 3600; // 2 годин уперед
 const BASE_DELAY_MS = 150;
 
 // =====================================================
