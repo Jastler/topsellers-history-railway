@@ -4,8 +4,9 @@ import { createClient } from "@supabase/supabase-js";
 // =====================================================
 // CONFIG
 // =====================================================
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_SERVICE_ROLE = process.env.SUPABASE_SERVICE_ROLE;
+const SUPABASE_URL = "https://psztbppcuwnrbiguicdn.supabase.co";
+const SUPABASE_SERVICE_ROLE =
+  "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBzenRicHBjdXducmJpZ3VpY2RuIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc2Mjg1OTA4MiwiZXhwIjoyMDc4NDM1MDgyfQ.dl_mOJeJzvmaip_hr6LlyApMo5kzEXQklCE_ZNmhuWw";
 
 const supabaseAnalytics = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE, {
   db: { schema: "analytics" },
