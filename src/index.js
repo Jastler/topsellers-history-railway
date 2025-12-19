@@ -4,18 +4,13 @@ import { createClient } from "@supabase/supabase-js";
 import "dotenv/config";
 
 /**
- * =====================================================
- * CONFIG
- * =====================================================
+ * ================= CONFIG =================
  */
 
 const BASE_URL =
   "https://store.steampowered.com/search/results/?query&count=100&ignore_preferences=1";
 
 const MAX_PAGES = 100;
-
-// Steam реально віддає
-const STEAM_PAGE_SIZE = 100;
 
 // Як показує фронт
 const FRONT_PAGE_SIZE = 10;
@@ -52,9 +47,7 @@ const REGIONS = [
 ];
 
 /**
- * =====================================================
- * SUPABASE
- * =====================================================
+ * ================= SUPABASE =================
  */
 
 const supabase = createClient(
@@ -64,9 +57,7 @@ const supabase = createClient(
 );
 
 /**
- * =====================================================
- * HELPERS
- * =====================================================
+ * ================= HELPERS =================
  */
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -81,9 +72,7 @@ function extractAppId(url) {
 }
 
 /**
- * =====================================================
- * FIXED UTC SCHEDULER (05 15 25 35 45 55)
- * =====================================================
+ * ================= FIXED UTC SCHEDULER =================
  */
 
 function getNextRunAtUTC(now = new Date()) {
@@ -125,9 +114,7 @@ async function sleepUntil(ts) {
 }
 
 /**
- * =====================================================
- * SCRAPER
- * =====================================================
+ * ================= SCRAPER =================
  */
 
 async function scrapePage({ cc, page, ts, rankRef }) {
@@ -177,9 +164,7 @@ async function scrapePage({ cc, page, ts, rankRef }) {
 }
 
 /**
- * =====================================================
- * SNAPSHOT FOR ONE REGION
- * =====================================================
+ * ================= SNAPSHOT REGION =================
  */
 
 async function runSnapshotForRegion({ cc, ts }) {
@@ -203,18 +188,15 @@ async function runSnapshotForRegion({ cc, ts }) {
     return null;
   }
 
-  return {
-    rows,
-    unique,
-    // ✅ ПРАВИЛЬНО
-    totalPages: Math.ceil(unique.length / FRONT_PAGE_SIZE),
-  };
+  const totalPages = Math.ceil(unique.length / FRONT_PAGE_SIZE);
+
+  log(`Region ${cc}: items=${unique.length}, totalPages=${totalPages}`);
+
+  return { rows, unique, totalPages };
 }
 
 /**
- * =====================================================
- * MAIN SNAPSHOT
- * =====================================================
+ * ================= SNAPSHOT =================
  */
 
 async function runSnapshot() {
@@ -230,9 +212,11 @@ async function runSnapshot() {
       batch.map((r) => runSnapshotForRegion({ cc: r.cc, ts }))
     );
 
-    results.forEach((res, idx) => {
-      if (!res) return;
-      const cc = batch[idx].cc;
+    for (let i = 0; i < results.length; i++) {
+      const res = results[i];
+      if (!res) continue;
+
+      const cc = batch[i].cc;
 
       historyRows.push(...res.rows);
 
@@ -245,15 +229,15 @@ async function runSnapshot() {
         }))
       );
 
-      // 🔒 Пишемо ОДНУ країну — БЕЗ merge
-      supabase
+      // ✅ ОДНА країна, з await
+      await supabase
         .from("steam_topsellers_pages_region")
         .update({
           total_pages: res.totalPages,
           updated_ts: ts,
         })
         .eq("cc", cc);
-    });
+    }
   }
 
   // INSERT HISTORY
@@ -272,9 +256,7 @@ async function runSnapshot() {
 }
 
 /**
- * =====================================================
- * LOOP
- * =====================================================
+ * ================= LOOP =================
  */
 
 async function main() {
