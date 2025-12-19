@@ -15,7 +15,7 @@ const FRONT_PAGE_SIZE = 10;
 
 const PAGE_DELAY_MS = 30;
 const CONCURRENCY = 4;
-const INSERT_CONCURRENCY = 2; // Micro-safe
+const INSERT_CONCURRENCY = 2; // Supabase Micro-safe
 
 const TIMEOUT_MS = 40000;
 const MAX_ATTEMPTS = 6;
@@ -79,8 +79,7 @@ function chunkArray(arr, size) {
 }
 
 /**
- * ================= FIXED UTC SCHEDULER =================
- * Запуск рівно: 00 10 20 30 40 50
+ * ================= UTC SCHEDULER (00 10 20 30 40 50) =================
  */
 
 function getNextRunAtUTC(now = new Date()) {
@@ -116,23 +115,19 @@ function getNextRunAtUTC(now = new Date()) {
 async function sleepUntil(ts) {
   const ms = ts - Date.now();
   if (ms > 0) {
-    log(
-      `Waiting ${Math.round(ms / 1000)}s until ${new Date(ts).toISOString()}`
-    );
+    log(`Waiting ${Math.round(ms / 1000)}s`);
     await sleep(ms);
   }
 }
 
 /**
- * ================= INSERT / UPSERT WITH CONCURRENCY =================
+ * ================= DB HELPERS =================
  */
 
 async function insertWithConcurrency(table, chunks) {
   if (!chunks.length) return;
 
-  log(
-    `INSERT ${table}: ${chunks.length} chunks (concurrency=${INSERT_CONCURRENCY})`
-  );
+  log(`INSERT ${table}: ${chunks.length} chunks`);
 
   for (let i = 0; i < chunks.length; i += INSERT_CONCURRENCY) {
     const batch = chunks.slice(i, i + INSERT_CONCURRENCY);
@@ -143,10 +138,7 @@ async function insertWithConcurrency(table, chunks) {
     );
 
     for (const r of results) {
-      if (r?.error) {
-        log(`❌ INSERT FAILED ${table}: ${r.error.message}`);
-        throw r.error;
-      }
+      if (r?.error) throw r.error;
     }
   }
 
@@ -158,9 +150,7 @@ async function upsertWithConcurrency(table, rows, conflict) {
 
   const chunks = chunkArray(rows, CHUNK_SIZE);
 
-  log(
-    `UPSERT ${table}: ${rows.length} rows, ${chunks.length} chunks (concurrency=${INSERT_CONCURRENCY})`
-  );
+  log(`UPSERT ${table}: ${rows.length} rows (${chunks.length} chunks)`);
 
   for (let i = 0; i < chunks.length; i += INSERT_CONCURRENCY) {
     const batch = chunks.slice(i, i + INSERT_CONCURRENCY);
@@ -173,10 +163,7 @@ async function upsertWithConcurrency(table, rows, conflict) {
     );
 
     for (const r of results) {
-      if (r?.error) {
-        log(`❌ UPSERT FAILED ${table}: ${r.error.message}`);
-        throw r.error;
-      }
+      if (r?.error) throw r.error;
     }
   }
 
@@ -220,8 +207,6 @@ async function scrapePage({ cc, page, ts, rankRef }) {
       await sleep(3000);
     }
   }
-
-  return [];
 }
 
 /**
@@ -293,18 +278,28 @@ async function runSnapshot() {
     }
   }
 
-  log(`UPSERT pages: ${pages.length} rows`);
-  if (pages.length) {
-    const p = await supabase
-      .from("steam_topsellers_pages_region")
-      .upsert(pages, { onConflict: "cc" });
-    if (p.error) throw p.error;
-  }
+  // ===== PAGES =====
+  log(`PAGES upsert: ${pages.length}`);
+  await supabase
+    .from("steam_topsellers_pages_region")
+    .upsert(pages, { onConflict: "cc" });
 
+  // ===== HISTORY =====
   await insertWithConcurrency(
     "steam_topsellers_history_region",
     chunkArray(history, CHUNK_SIZE)
   );
+
+  // ===== CURRENT (FIX: REPLACE LIST) =====
+  const regionCodes = REGIONS.map((r) => r.cc);
+  log(`DELETE current_region for: ${regionCodes.join(", ")}`);
+
+  const del = await supabase
+    .from("steam_topsellers_current_region")
+    .delete()
+    .in("cc", regionCodes);
+
+  if (del.error) throw del.error;
 
   await upsertWithConcurrency(
     "steam_topsellers_current_region",
