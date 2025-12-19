@@ -14,10 +14,10 @@ const BASE_URL =
 
 const MAX_PAGES = 100;
 
-// Steam фактично
+// Steam реально віддає
 const STEAM_PAGE_SIZE = 100;
 
-// Як рахуємо на фронті
+// Як показує фронт
 const FRONT_PAGE_SIZE = 10;
 
 const PAGE_DELAY_MS = 30;
@@ -119,9 +119,7 @@ function getNextRunAtUTC(now = new Date()) {
 async function sleepUntil(ts) {
   const ms = ts - Date.now();
   if (ms > 0) {
-    log(
-      `Waiting until ${new Date(ts).toISOString()} (${Math.round(ms / 1000)}s)`
-    );
+    log(`Waiting until ${new Date(ts).toISOString()}`);
     await sleep(ms);
   }
 }
@@ -189,7 +187,6 @@ async function runSnapshotForRegion({ cc, ts }) {
 
   let rows = [];
   let rankRef = { value: 1 };
-  let steamPages = 0;
 
   for (let page = 1; page <= MAX_PAGES; page++) {
     await sleep(PAGE_DELAY_MS);
@@ -197,17 +194,20 @@ async function runSnapshotForRegion({ cc, ts }) {
     const pageRows = await scrapePage({ cc, page, ts, rankRef });
     if (pageRows.length === 0) break;
 
-    steamPages = page;
     rows.push(...pageRows);
   }
 
   const unique = [...new Map(rows.map((r) => [r.appid, r])).values()];
-  if (unique.length < MIN_VALID_ITEMS_REGION) return null;
+  if (unique.length < MIN_VALID_ITEMS_REGION) {
+    log(`Region ${cc}: skipped (${unique.length})`);
+    return null;
+  }
 
   return {
     rows,
     unique,
-    totalPages: Math.floor((steamPages * STEAM_PAGE_SIZE) / FRONT_PAGE_SIZE),
+    // ✅ ПРАВИЛЬНО
+    totalPages: Math.ceil(unique.length / FRONT_PAGE_SIZE),
   };
 }
 
@@ -223,7 +223,6 @@ async function runSnapshot() {
 
   let historyRows = [];
   let currentRows = [];
-  let pagesRows = [];
 
   for (let i = 0; i < REGIONS.length; i += CONCURRENCY) {
     const batch = REGIONS.slice(i, i + CONCURRENCY);
@@ -246,11 +245,14 @@ async function runSnapshot() {
         }))
       );
 
-      pagesRows.push({
-        cc,
-        total_pages: res.totalPages,
-        updated_ts: ts,
-      });
+      // 🔒 Пишемо ОДНУ країну — БЕЗ merge
+      supabase
+        .from("steam_topsellers_pages_region")
+        .update({
+          total_pages: res.totalPages,
+          updated_ts: ts,
+        })
+        .eq("cc", cc);
     });
   }
 
@@ -266,22 +268,6 @@ async function runSnapshot() {
     .from("steam_topsellers_current_region")
     .upsert(currentRows, { onConflict: "appid,cc" });
 
-  /**
-   * ===== MERGE pages_region (не затираємо інші країни) =====
-   */
-  const { data: existing } = await supabase
-    .from("steam_topsellers_pages_region")
-    .select("cc, total_pages, updated_ts");
-
-  const map = new Map(existing?.map((r) => [r.cc, r]) ?? []);
-  for (const row of pagesRows) {
-    map.set(row.cc, row);
-  }
-
-  await supabase
-    .from("steam_topsellers_pages_region")
-    .upsert([...map.values()], { onConflict: "cc" });
-
   log("SNAPSHOT done");
 }
 
@@ -295,7 +281,7 @@ async function main() {
   let running = false;
 
   while (true) {
-    const next = getNextRunAtUTC(new Date());
+    const next = getNextRunAtUTC();
     await sleepUntil(next);
 
     if (running) continue;
