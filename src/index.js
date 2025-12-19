@@ -13,7 +13,9 @@ const BASE_URL =
   "https://store.steampowered.com/search/results/?query&count=100&ignore_preferences=1";
 
 const MAX_PAGES = 100;
-const PAGE_SIZE = 100;
+
+const STEAM_PAGE_SIZE = 100;
+const FRONT_PAGE_SIZE = 10;
 
 const PAGE_DELAY_MS = 30;
 const CONCURRENCY = 4;
@@ -77,7 +79,7 @@ function extractAppId(url) {
 
 /**
  * =====================================================
- * FIXED UTC SCHEDULER
+ * FIXED UTC SCHEDULER (05 15 25 35 45 55)
  * =====================================================
  */
 
@@ -191,7 +193,7 @@ async function runSnapshotForRegion({ cc, ts }) {
 
   let rows = [];
   let rankRef = { value: 1 };
-  let lastPage = 0;
+  let steamPages = 0;
 
   for (let page = 1; page <= MAX_PAGES; page++) {
     await sleep(PAGE_DELAY_MS);
@@ -203,7 +205,7 @@ async function runSnapshotForRegion({ cc, ts }) {
       break;
     }
 
-    lastPage = page;
+    steamPages = page;
     rows.push(...pageRows);
   }
 
@@ -214,14 +216,14 @@ async function runSnapshotForRegion({ cc, ts }) {
     return null;
   }
 
-  log(
-    `Region ${cc}: rows=${rows.length}, unique=${unique.length}, pages=${lastPage}`
-  );
+  const frontendPages = steamPages * (STEAM_PAGE_SIZE / FRONT_PAGE_SIZE);
+
+  log(`Region ${cc}: steamPages=${steamPages}, frontendPages=${frontendPages}`);
 
   return {
     rows,
     unique,
-    totalPages: lastPage,
+    totalPages: frontendPages,
   };
 }
 
@@ -294,7 +296,7 @@ async function runSnapshot() {
     .from("steam_topsellers_current_region")
     .upsert(currentRows, { onConflict: "appid,cc" });
 
-  // UPSERT TOTAL PAGES PER REGION
+  // UPSERT TOTAL PAGES (10 items per page)
   await supabase
     .from("steam_topsellers_pages_region")
     .upsert(pagesRows, { onConflict: "cc" });
