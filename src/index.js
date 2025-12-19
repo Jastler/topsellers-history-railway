@@ -14,7 +14,10 @@ const BASE_URL =
 
 const MAX_PAGES = 100;
 
+// Steam фактично
 const STEAM_PAGE_SIZE = 100;
+
+// Як рахуємо на фронті
 const FRONT_PAGE_SIZE = 10;
 
 const PAGE_DELAY_MS = 30;
@@ -79,6 +82,52 @@ function extractAppId(url) {
 
 /**
  * =====================================================
+ * FIXED UTC SCHEDULER (05 15 25 35 45 55)
+ * =====================================================
+ */
+
+function getNextRunAtUTC(now = new Date()) {
+  const minutes = now.getUTCMinutes();
+  const hours = now.getUTCHours();
+  const slots = [5, 15, 25, 35, 45, 55];
+
+  for (const m of slots) {
+    if (minutes < m) {
+      return Date.UTC(
+        now.getUTCFullYear(),
+        now.getUTCMonth(),
+        now.getUTCDate(),
+        hours,
+        m,
+        0,
+        0
+      );
+    }
+  }
+
+  return Date.UTC(
+    now.getUTCFullYear(),
+    now.getUTCMonth(),
+    now.getUTCDate(),
+    hours + 1,
+    5,
+    0,
+    0
+  );
+}
+
+async function sleepUntil(ts) {
+  const ms = ts - Date.now();
+  if (ms > 0) {
+    log(
+      `Waiting until ${new Date(ts).toISOString()} (${Math.round(ms / 1000)}s)`
+    );
+    await sleep(ms);
+  }
+}
+
+/**
+ * =====================================================
  * SCRAPER
  * =====================================================
  */
@@ -113,7 +162,12 @@ async function scrapePage({ cc, page, ts, rankRef }) {
         const appid = extractAppId($(el).attr("href"));
         if (!appid) return;
 
-        rows.push({ appid, cc, rank: rankRef.value++, ts });
+        rows.push({
+          appid,
+          cc,
+          rank: rankRef.value++,
+          ts,
+        });
       });
 
       return rows;
@@ -165,6 +219,7 @@ async function runSnapshotForRegion({ cc, ts }) {
 
 async function runSnapshot() {
   const ts = Math.floor(Date.now() / 1000);
+  log(`SNAPSHOT start ts=${ts}`);
 
   let historyRows = [];
   let currentRows = [];
@@ -180,7 +235,7 @@ async function runSnapshot() {
       if (!res) return;
       const cc = batch[idx].cc;
 
-      historyRows.push(...res.rows.map((r) => ({ ...r, ts })));
+      historyRows.push(...res.rows);
 
       currentRows.push(
         ...res.unique.map((r) => ({
@@ -200,10 +255,11 @@ async function runSnapshot() {
   }
 
   // INSERT HISTORY
-  for (let i = 0; i < historyRows.length; i += CHUNK_SIZE)
+  for (let i = 0; i < historyRows.length; i += CHUNK_SIZE) {
     await supabase
       .from("steam_topsellers_history_region")
       .insert(historyRows.slice(i, i + CHUNK_SIZE));
+  }
 
   // UPSERT CURRENT
   await supabase
@@ -211,15 +267,13 @@ async function runSnapshot() {
     .upsert(currentRows, { onConflict: "appid,cc" });
 
   /**
-   * ===== 🔥 FIX: MERGE pages_region 🔥 =====
+   * ===== MERGE pages_region (не затираємо інші країни) =====
    */
-
   const { data: existing } = await supabase
     .from("steam_topsellers_pages_region")
     .select("cc, total_pages, updated_ts");
 
   const map = new Map(existing?.map((r) => [r.cc, r]) ?? []);
-
   for (const row of pagesRows) {
     map.set(row.cc, row);
   }
@@ -241,8 +295,8 @@ async function main() {
   let running = false;
 
   while (true) {
-    const nextRunAt = getNextRunAtUTC(new Date());
-    await sleepUntil(nextRunAt);
+    const next = getNextRunAtUTC(new Date());
+    await sleepUntil(next);
 
     if (running) continue;
     running = true;
