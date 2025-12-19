@@ -16,7 +16,7 @@ const FRONT_PAGE_SIZE = 10;
 const PAGE_DELAY_MS = 30;
 const CONCURRENCY = 4;
 
-const INSERT_CONCURRENCY = 2; // 👈 ВАЖЛИВО
+const INSERT_CONCURRENCY = 2; // 👈 стартуємо з 2
 
 const TIMEOUT_MS = 40000;
 const MAX_ATTEMPTS = 6;
@@ -72,14 +72,65 @@ function extractAppId(url) {
 }
 
 /**
- * ===== INSERT WITH CONCURRENCY =====
+ * ================= FIXED UTC SCHEDULER (05 15 25 35 45 55) =================
+ */
+
+function getNextRunAtUTC(now = new Date()) {
+  const minutes = now.getUTCMinutes();
+  const hours = now.getUTCHours();
+  const slots = [5, 15, 25, 35, 45, 55];
+
+  for (const m of slots) {
+    if (minutes < m) {
+      return Date.UTC(
+        now.getUTCFullYear(),
+        now.getUTCMonth(),
+        now.getUTCDate(),
+        hours,
+        m,
+        0,
+        0
+      );
+    }
+  }
+
+  return Date.UTC(
+    now.getUTCFullYear(),
+    now.getUTCMonth(),
+    now.getUTCDate(),
+    hours + 1,
+    5,
+    0,
+    0
+  );
+}
+
+async function sleepUntil(ts) {
+  const ms = ts - Date.now();
+  if (ms > 0) {
+    log(
+      `Waiting until ${new Date(ts).toISOString()} (${Math.round(ms / 1000)}s)`
+    );
+    await sleep(ms);
+  }
+}
+
+/**
+ * ================= INSERT WITH CONCURRENCY =================
  */
 
 async function insertWithConcurrency(table, chunks) {
   for (let i = 0; i < chunks.length; i += INSERT_CONCURRENCY) {
     const batch = chunks.slice(i, i + INSERT_CONCURRENCY);
 
-    await Promise.all(batch.map((chunk) => supabase.from(table).insert(chunk)));
+    const results = await Promise.all(
+      batch.map((chunk) => supabase.from(table).insert(chunk))
+    );
+
+    // якщо щось впало — покажемо
+    for (const r of results) {
+      if (r?.error) throw r.error;
+    }
   }
 }
 
@@ -138,6 +189,8 @@ async function scrapePage({ cc, page, ts, rankRef }) {
  */
 
 async function runSnapshotForRegion({ cc, ts }) {
+  log(`Region ${cc}: start`);
+
   let rows = [];
   let rankRef = { value: 1 };
 
@@ -151,13 +204,15 @@ async function runSnapshotForRegion({ cc, ts }) {
   }
 
   const unique = [...new Map(rows.map((r) => [r.appid, r])).values()];
-  if (unique.length < MIN_VALID_ITEMS_REGION) return null;
+  if (unique.length < MIN_VALID_ITEMS_REGION) {
+    log(`Region ${cc}: skipped (${unique.length})`);
+    return null;
+  }
 
-  return {
-    rows,
-    unique,
-    totalPages: Math.ceil(unique.length / FRONT_PAGE_SIZE),
-  };
+  const totalPages = Math.ceil(unique.length / FRONT_PAGE_SIZE);
+  log(`Region ${cc}: items=${unique.length}, totalPages=${totalPages}`);
+
+  return { rows, unique, totalPages };
 }
 
 /**
@@ -194,36 +249,44 @@ async function runSnapshot() {
         }))
       );
 
-      // pages — ОДНА країна
-      await supabase
+      // pages — ОДНА країна (без merge)
+      const upd = await supabase
         .from("steam_topsellers_pages_region")
         .update({
           total_pages: res.totalPages,
           updated_ts: ts,
         })
         .eq("cc", cc);
+
+      // якщо рядка ще нема — тоді upsert (бо update нічого не оновить)
+      if (!upd.error && Array.isArray(upd.data) && upd.data.length === 0) {
+        const ins = await supabase
+          .from("steam_topsellers_pages_region")
+          .upsert(
+            { cc, total_pages: res.totalPages, updated_ts: ts },
+            { onConflict: "cc" }
+          );
+        if (ins.error) throw ins.error;
+      } else if (upd.error) {
+        throw upd.error;
+      }
     }
   }
 
-  /**
-   * ===== CHUNK HISTORY =====
-   */
+  // ===== INSERT HISTORY (concurrency=2) =====
   const historyChunks = [];
   for (let i = 0; i < historyRows.length; i += CHUNK_SIZE) {
     historyChunks.push(historyRows.slice(i, i + CHUNK_SIZE));
   }
 
-  /**
-   * ===== INSERT HISTORY WITH CONCURRENCY = 2 =====
-   */
   await insertWithConcurrency("steam_topsellers_history_region", historyChunks);
 
-  /**
-   * ===== UPSERT CURRENT =====
-   */
-  await supabase
+  // ===== UPSERT CURRENT =====
+  const cur = await supabase
     .from("steam_topsellers_current_region")
     .upsert(currentRows, { onConflict: "appid,cc" });
+
+  if (cur.error) throw cur.error;
 
   log("SNAPSHOT done");
 }
@@ -244,6 +307,8 @@ async function main() {
 
     try {
       await runSnapshot();
+    } catch (e) {
+      log(`SNAPSHOT failed: ${e.message}`);
     } finally {
       running = false;
     }
