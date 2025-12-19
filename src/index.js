@@ -1,244 +1,315 @@
 import fetch from "node-fetch";
+import * as cheerio from "cheerio";
 import { createClient } from "@supabase/supabase-js";
+import "dotenv/config";
 
-// =====================================================
-// CONFIG
-// =====================================================
-const SUPABASE_URL = "https://psztbppcuwnrbiguicdn.supabase.co";
-const SUPABASE_SERVICE_ROLE =
-  "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBzenRicHBjdXducmJpZ3VpY2RuIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc2Mjg1OTA4MiwiZXhwIjoyMDc4NDM1MDgyfQ.dl_mOJeJzvmaip_hr6LlyApMo5kzEXQklCE_ZNmhuWw";
+/**
+ * =====================================================
+ * CONFIG
+ * =====================================================
+ */
 
-const supabaseAnalytics = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE, {
-  db: { schema: "analytics" },
-});
+const BASE_URL =
+  "https://store.steampowered.com/search/results/?query&count=100&ignore_preferences=1";
 
-const supabasePublic = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE, {
-  db: { schema: "public" },
-});
+const MAX_PAGES = 100;
+const PAGE_SIZE = 100;
 
-const API_ROOT = "https://games-popularity.com/swagger/api/game/players";
+const PAGE_DELAY_MS = 30;
+const CONCURRENCY = 4; // можеш піднімати
 
-// ❗ ЖОРСТКИЙ СТАРТ
-const START_INDEX = 71655;
+const TIMEOUT_MS = 40000;
+const MAX_ATTEMPTS = 6;
+const CHUNK_SIZE = 1000;
 
-// ❗ НЕ беремо новіші
-const CUTOFF_TS = 1765422000;
+const MIN_VALID_ITEMS_REGION = 500;
 
-// forward-fill максимум 5 годин
-const FORWARD_WINDOW = 5 * 3600;
+/**
+ * SECONDARY REGIONS (NO GLOBAL)
+ */
+const REGIONS = [
+  { cc: "us" },
+  { cc: "at" },
+  { cc: "au" },
+  { cc: "be" },
+  { cc: "br" },
+  { cc: "ch" },
+  { cc: "cz" },
+  { cc: "dk" },
+  { cc: "gb" },
+  { cc: "hk" },
+  { cc: "jp" },
+  { cc: "kr" },
+  { cc: "nz" },
+  { cc: "se" },
+  { cc: "sg" },
+  { cc: "tw" },
+];
 
-// throttle
-const BASE_DELAY_MS = 150;
+/**
+ * =====================================================
+ * SUPABASE
+ * =====================================================
+ */
 
-// =====================================================
-// MASTER TIMESTAMPS
-// =====================================================
-let MASTER_TS = [];
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_ROLE,
+  { db: { schema: "analytics" } }
+);
 
-// =====================================================
-// UTILS
-// =====================================================
+/**
+ * =====================================================
+ * HELPERS
+ * =====================================================
+ */
+
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// =====================================================
-// FORWARD SEARCH (тільки в майбутнє ≤ 5h)
-// =====================================================
-function findNearestForward(masterTs, rawList) {
-  const limit = masterTs + FORWARD_WINDOW;
-
-  // rawList відсортований
-  for (const t of rawList) {
-    if (t < masterTs) continue;
-    if (t > limit) break;
-    return t; // перший валідний — найближчий
-  }
-
-  return null;
+function log(msg) {
+  console.log(`[${new Date().toISOString()}] ${msg}`);
 }
 
-// =====================================================
-// LOAD MASTER TIMESTAMPS
-// =====================================================
-async function loadMasterTimestamps() {
-  console.log("📥 Loading master timestamps...");
+function extractAppId(url) {
+  const m = url?.match(/\/app\/(\d+)/);
+  return m ? Number(m[1]) : null;
+}
 
-  let all = [];
-  let from = 0;
-  const size = 1000;
+/**
+ * =====================================================
+ * FIXED UTC SCHEDULER (05 15 25 35 45 55)
+ * =====================================================
+ */
 
-  while (true) {
-    const { data, error } = await supabaseAnalytics
-      .from("steam_ccu_timestamps")
-      .select("ts")
-      .order("ts")
-      .range(from, from + size - 1);
+function getNextRunAtUTC(now = new Date()) {
+  const minutes = now.getUTCMinutes();
+  const hours = now.getUTCHours();
+  const slots = [5, 15, 25, 35, 45, 55];
 
-    if (error) {
-      console.error("❌ timestamp load error:", error);
-      process.exit(1);
+  for (const m of slots) {
+    if (minutes < m) {
+      return Date.UTC(
+        now.getUTCFullYear(),
+        now.getUTCMonth(),
+        now.getUTCDate(),
+        hours,
+        m,
+        0,
+        0
+      );
     }
-
-    all.push(...data);
-    if (data.length < size) break;
-    from += size;
   }
 
-  MASTER_TS = all
-    .map((x) => x.ts)
-    .filter((ts) => ts < CUTOFF_TS)
-    .sort((a, b) => a - b);
-
-  console.log(`✔ Loaded ${MASTER_TS.length} master timestamps`);
+  return Date.UTC(
+    now.getUTCFullYear(),
+    now.getUTCMonth(),
+    now.getUTCDate(),
+    hours + 1,
+    5,
+    0,
+    0
+  );
 }
 
-// =====================================================
-// FETCH PAGE
-// =====================================================
-async function fetchPage(appid, cursor) {
-  const url = `${API_ROOT}/${appid}?cursor=${encodeURIComponent(cursor)}`;
+async function sleepUntil(ts) {
+  const ms = ts - Date.now();
+  if (ms > 0) {
+    log(
+      `Waiting until ${new Date(ts).toISOString()} (${Math.round(ms / 1000)}s)`
+    );
+    await sleep(ms);
+  }
+}
 
-  while (true) {
+/**
+ * =====================================================
+ * SCRAPER
+ * =====================================================
+ */
+
+async function scrapePage({ cc, page, ts, rankRef }) {
+  const url = `${BASE_URL}&filter=topsellers&cc=${cc}&page=${page}`;
+
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     try {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), TIMEOUT_MS);
+
       const res = await fetch(url, {
+        signal: controller.signal,
         headers: { "User-Agent": "Mozilla/5.0" },
       });
 
-      if (res.status === 404)
-        return { skip: true, history: [], nextCursor: null };
+      clearTimeout(timeoutId);
 
-      if (res.status === 429) {
-        console.log("⚠ 429 → wait 60s");
-        await sleep(60000);
-        continue;
-      }
-
-      if (!res.ok) {
+      if (res.status === 429 || res.status === 503) {
+        log(`Rate limit ${res.status}, retry ${attempt}`);
         await sleep(3000);
         continue;
       }
 
-      return await res.json();
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+      const html = await res.text();
+      const $ = cheerio.load(html);
+
+      const rows = [];
+
+      $(".search_result_row").each((_, el) => {
+        const appid = extractAppId($(el).attr("href"));
+        if (!appid) return;
+
+        rows.push({
+          appid,
+          cc,
+          rank: rankRef.value++,
+          ts,
+        });
+      });
+
+      return rows;
     } catch {
-      await sleep(5000);
+      if (attempt === MAX_ATTEMPTS) {
+        log(`Page ${page} failed permanently`);
+        return [];
+      }
+      await sleep(3000);
     }
   }
+
+  return [];
 }
 
-// =====================================================
-// INSERT CCU (NO ZEROES)
-// =====================================================
-async function insertCcuRows(appid, items) {
-  if (!items?.length) return 0;
+/**
+ * =====================================================
+ * SNAPSHOT FOR ONE REGION
+ * =====================================================
+ */
 
-  const rawMap = new Map();
-  const rawList = [];
+async function runSnapshotForRegion({ cc, ts }) {
+  log(`Region ${cc}: start`);
 
-  for (const h of items) {
-    const ts = Math.floor(new Date(h.added).getTime() / 1000);
-    if (ts >= CUTOFF_TS) continue;
+  let rows = [];
+  let rankRef = { value: 1 };
 
-    const online = h.players ?? 0;
-    if (online <= 0) continue; // ❗ НІКОЛИ не пишемо 0
+  for (let page = 1; page <= MAX_PAGES; page++) {
+    await sleep(PAGE_DELAY_MS);
 
-    rawMap.set(ts, online);
-    rawList.push(ts);
+    const pageRows = await scrapePage({ cc, page, ts, rankRef });
+
+    if (pageRows.length === 0) {
+      log(`Region ${cc}: stop at page ${page}`);
+      break;
+    }
+
+    rows.push(...pageRows);
   }
 
-  if (rawList.length === 0) return 0;
+  const unique = [...new Map(rows.map((r) => [r.appid, r])).values()];
 
-  rawList.sort((a, b) => a - b);
+  if (unique.length < MIN_VALID_ITEMS_REGION) {
+    log(`Region ${cc}: skipped (${unique.length} items)`);
+    return null;
+  }
 
-  const rows = [];
+  log(`Region ${cc}: rows=${rows.length}, unique=${unique.length}`);
+  return { rows, unique };
+}
 
-  for (const masterTs of MASTER_TS) {
-    // точний збіг
-    if (rawMap.has(masterTs)) {
-      rows.push({ appid, ts: masterTs, online: rawMap.get(masterTs) });
+/**
+ * =====================================================
+ * MAIN SNAPSHOT
+ * =====================================================
+ */
+
+async function runSnapshot() {
+  const ts = Math.floor(Date.now() / 1000);
+  const startedAt = Date.now();
+
+  log(`SNAPSHOT start ts=${ts}`);
+
+  let historyRows = [];
+  let currentRows = [];
+
+  for (let i = 0; i < REGIONS.length; i += CONCURRENCY) {
+    const batch = REGIONS.slice(i, i + CONCURRENCY);
+    log(`Batch: ${batch.map((b) => b.cc).join(", ")}`);
+
+    const results = await Promise.all(
+      batch.map((r) => runSnapshotForRegion({ cc: r.cc, ts }))
+    );
+
+    for (let j = 0; j < results.length; j++) {
+      const result = results[j];
+      if (!result) continue;
+
+      const cc = batch[j].cc;
+      const { rows, unique } = result;
+
+      historyRows.push(
+        ...rows.map(({ appid, cc, rank, ts }) => ({
+          appid,
+          cc,
+          rank,
+          ts,
+        }))
+      );
+
+      currentRows.push(
+        ...unique.map((r) => ({
+          appid: r.appid,
+          cc,
+          rank: r.rank,
+          updated_ts: ts,
+        }))
+      );
+    }
+  }
+
+  // INSERT HISTORY
+  for (let i = 0; i < historyRows.length; i += CHUNK_SIZE) {
+    await supabase
+      .from("steam_topsellers_history_region")
+      .insert(historyRows.slice(i, i + CHUNK_SIZE));
+  }
+
+  // UPSERT CURRENT
+  await supabase
+    .from("steam_topsellers_current_region")
+    .upsert(currentRows, { onConflict: "appid,cc" });
+
+  const duration = ((Date.now() - startedAt) / 1000).toFixed(1);
+  log(`SNAPSHOT done in ${duration}s`);
+}
+
+/**
+ * =====================================================
+ * LOOP
+ * =====================================================
+ */
+
+async function main() {
+  let running = false;
+
+  while (true) {
+    const nextRunAt = getNextRunAtUTC(new Date());
+    await sleepUntil(nextRunAt);
+
+    if (running) {
+      log("Previous snapshot still running — skipping slot");
       continue;
     }
 
-    // forward-fill
-    const nearest = findNearestForward(masterTs, rawList);
-    if (nearest !== null) {
-      rows.push({ appid, ts: masterTs, online: rawMap.get(nearest) });
+    running = true;
+
+    try {
+      await runSnapshot();
+    } catch (err) {
+      log(`SNAPSHOT failed: ${err.message}`);
+    } finally {
+      running = false;
     }
-    // ❗ інакше — нічого
   }
-
-  if (rows.length === 0) return 0;
-
-  const { error } = await supabaseAnalytics
-    .from("steam_ccu")
-    .upsert(rows, { onConflict: "appid,ts", returning: "minimal" });
-
-  if (error) console.error("❌ UPSERT ERROR", error);
-
-  return rows.length;
-}
-
-// =====================================================
-// PROCESS ONE APP
-// =====================================================
-async function processApp(appid, index, total) {
-  console.log(`\n=== APP ${appid} (${index}/${total}) ===`);
-
-  let cursor = "0";
-  let allItems = [];
-
-  while (true) {
-    const data = await fetchPage(appid, cursor);
-    if (data.skip) break;
-
-    if (data.history?.length) allItems.push(...data.history);
-    if (!data.nextCursor) break;
-
-    cursor = data.nextCursor;
-    await sleep(BASE_DELAY_MS);
-  }
-
-  const inserted = await insertCcuRows(appid, allItems);
-  console.log(`✔ inserted ${inserted}`);
-}
-
-// =====================================================
-// LOAD APPIDS
-// =====================================================
-async function loadAllAppIds() {
-  let out = [];
-  let from = 0;
-  const size = 1000;
-
-  while (true) {
-    const { data, error } = await supabasePublic
-      .from("steam_app_details")
-      .select("appid")
-      .order("appid")
-      .range(from, from + size - 1);
-
-    if (error) process.exit(1);
-    out.push(...data);
-
-    if (data.length < size) break;
-    from += size;
-  }
-
-  return out.map((x) => x.appid);
-}
-
-// =====================================================
-// MAIN
-// =====================================================
-async function main() {
-  await loadMasterTimestamps();
-
-  const appids = await loadAllAppIds();
-  console.log(`🚀 START FROM INDEX ${START_INDEX}`);
-
-  for (let i = START_INDEX; i < appids.length; i++) {
-    await processApp(appids[i], i + 1, appids.length);
-  }
-
-  console.log("✅ DONE");
 }
 
 main().catch(console.error);
