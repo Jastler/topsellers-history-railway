@@ -11,12 +11,12 @@ const BASE_URL =
   "https://store.steampowered.com/search/results/?query&count=100&ignore_preferences=1";
 
 const MAX_PAGES = 100;
-
-// Як показує фронт
 const FRONT_PAGE_SIZE = 10;
 
 const PAGE_DELAY_MS = 30;
 const CONCURRENCY = 4;
+
+const INSERT_CONCURRENCY = 2; // 👈 ВАЖЛИВО
 
 const TIMEOUT_MS = 40000;
 const MAX_ATTEMPTS = 6;
@@ -72,44 +72,14 @@ function extractAppId(url) {
 }
 
 /**
- * ================= FIXED UTC SCHEDULER =================
+ * ===== INSERT WITH CONCURRENCY =====
  */
 
-function getNextRunAtUTC(now = new Date()) {
-  const minutes = now.getUTCMinutes();
-  const hours = now.getUTCHours();
-  const slots = [5, 15, 25, 35, 45, 55];
+async function insertWithConcurrency(table, chunks) {
+  for (let i = 0; i < chunks.length; i += INSERT_CONCURRENCY) {
+    const batch = chunks.slice(i, i + INSERT_CONCURRENCY);
 
-  for (const m of slots) {
-    if (minutes < m) {
-      return Date.UTC(
-        now.getUTCFullYear(),
-        now.getUTCMonth(),
-        now.getUTCDate(),
-        hours,
-        m,
-        0,
-        0
-      );
-    }
-  }
-
-  return Date.UTC(
-    now.getUTCFullYear(),
-    now.getUTCMonth(),
-    now.getUTCDate(),
-    hours + 1,
-    5,
-    0,
-    0
-  );
-}
-
-async function sleepUntil(ts) {
-  const ms = ts - Date.now();
-  if (ms > 0) {
-    log(`Waiting until ${new Date(ts).toISOString()}`);
-    await sleep(ms);
+    await Promise.all(batch.map((chunk) => supabase.from(table).insert(chunk)));
   }
 }
 
@@ -168,8 +138,6 @@ async function scrapePage({ cc, page, ts, rankRef }) {
  */
 
 async function runSnapshotForRegion({ cc, ts }) {
-  log(`Region ${cc}: start`);
-
   let rows = [];
   let rankRef = { value: 1 };
 
@@ -183,16 +151,13 @@ async function runSnapshotForRegion({ cc, ts }) {
   }
 
   const unique = [...new Map(rows.map((r) => [r.appid, r])).values()];
-  if (unique.length < MIN_VALID_ITEMS_REGION) {
-    log(`Region ${cc}: skipped (${unique.length})`);
-    return null;
-  }
+  if (unique.length < MIN_VALID_ITEMS_REGION) return null;
 
-  const totalPages = Math.ceil(unique.length / FRONT_PAGE_SIZE);
-
-  log(`Region ${cc}: items=${unique.length}, totalPages=${totalPages}`);
-
-  return { rows, unique, totalPages };
+  return {
+    rows,
+    unique,
+    totalPages: Math.ceil(unique.length / FRONT_PAGE_SIZE),
+  };
 }
 
 /**
@@ -212,11 +177,11 @@ async function runSnapshot() {
       batch.map((r) => runSnapshotForRegion({ cc: r.cc, ts }))
     );
 
-    for (let i = 0; i < results.length; i++) {
-      const res = results[i];
+    for (let j = 0; j < results.length; j++) {
+      const res = results[j];
       if (!res) continue;
 
-      const cc = batch[i].cc;
+      const cc = batch[j].cc;
 
       historyRows.push(...res.rows);
 
@@ -229,7 +194,7 @@ async function runSnapshot() {
         }))
       );
 
-      // ✅ ОДНА країна, з await
+      // pages — ОДНА країна
       await supabase
         .from("steam_topsellers_pages_region")
         .update({
@@ -240,14 +205,22 @@ async function runSnapshot() {
     }
   }
 
-  // INSERT HISTORY
+  /**
+   * ===== CHUNK HISTORY =====
+   */
+  const historyChunks = [];
   for (let i = 0; i < historyRows.length; i += CHUNK_SIZE) {
-    await supabase
-      .from("steam_topsellers_history_region")
-      .insert(historyRows.slice(i, i + CHUNK_SIZE));
+    historyChunks.push(historyRows.slice(i, i + CHUNK_SIZE));
   }
 
-  // UPSERT CURRENT
+  /**
+   * ===== INSERT HISTORY WITH CONCURRENCY = 2 =====
+   */
+  await insertWithConcurrency("steam_topsellers_history_region", historyChunks);
+
+  /**
+   * ===== UPSERT CURRENT =====
+   */
   await supabase
     .from("steam_topsellers_current_region")
     .upsert(currentRows, { onConflict: "appid,cc" });
