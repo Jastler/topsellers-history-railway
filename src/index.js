@@ -72,14 +72,13 @@ function extractAppId(url) {
 
 function chunkArray(arr, size) {
   const out = [];
-  for (let i = 0; i < arr.length; i += size) {
-    out.push(arr.slice(i, i + size));
-  }
+  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
   return out;
 }
 
 /**
- * ================= UTC SCHEDULER (00 10 20 30 40 50) =================
+ * ================= UTC SCHEDULER =================
+ * 00 10 20 30 40 50
  */
 
 function getNextRunAtUTC(now = new Date()) {
@@ -124,21 +123,26 @@ async function sleepUntil(ts) {
  * ================= DB HELPERS =================
  */
 
-async function insertWithConcurrency(table, chunks) {
-  if (!chunks.length) return;
+async function insertWithConcurrency(table, rows) {
+  if (!rows.length) return;
 
-  log(`INSERT ${table}: ${chunks.length} chunks`);
+  const chunks = chunkArray(rows, CHUNK_SIZE);
+  log(
+    `INSERT ${table}: ${rows.length} rows (${chunks.length} chunks, concurrency=${INSERT_CONCURRENCY})`
+  );
 
   for (let i = 0; i < chunks.length; i += INSERT_CONCURRENCY) {
     const batch = chunks.slice(i, i + INSERT_CONCURRENCY);
-    log(`→ INSERT ${table}: chunks ${i + 1}-${i + batch.length}`);
 
-    const results = await Promise.all(
-      batch.map((chunk) => supabase.from(table).insert(chunk))
+    const res = await Promise.all(
+      batch.map((c) => supabase.from(table).insert(c))
     );
 
-    for (const r of results) {
-      if (r?.error) throw r.error;
+    for (const r of res) {
+      if (r?.error) {
+        log(`❌ INSERT FAILED ${table}: ${r.error.message}`);
+        throw r.error;
+      }
     }
   }
 
@@ -149,25 +153,48 @@ async function upsertWithConcurrency(table, rows, conflict) {
   if (!rows.length) return;
 
   const chunks = chunkArray(rows, CHUNK_SIZE);
-
-  log(`UPSERT ${table}: ${rows.length} rows (${chunks.length} chunks)`);
+  log(
+    `UPSERT ${table}: ${rows.length} rows (${chunks.length} chunks, concurrency=${INSERT_CONCURRENCY})`
+  );
 
   for (let i = 0; i < chunks.length; i += INSERT_CONCURRENCY) {
     const batch = chunks.slice(i, i + INSERT_CONCURRENCY);
-    log(`→ UPSERT ${table}: chunks ${i + 1}-${i + batch.length}`);
 
-    const results = await Promise.all(
-      batch.map((chunk) =>
-        supabase.from(table).upsert(chunk, { onConflict: conflict })
-      )
+    const res = await Promise.all(
+      batch.map((c) => supabase.from(table).upsert(c, { onConflict: conflict }))
     );
 
-    for (const r of results) {
-      if (r?.error) throw r.error;
+    for (const r of res) {
+      if (r?.error) {
+        log(`❌ UPSERT FAILED ${table}: ${r.error.message}`);
+        throw r.error;
+      }
     }
   }
 
   log(`✔ UPSERT ${table} done`);
+}
+
+/**
+ * cleanup: видаляємо старі current ТІЛЬКИ для наших cc
+ */
+async function cleanupCurrentForRegions({ ccs, ts }) {
+  log(
+    `CLEANUP current_region: cc IN (${ccs.join(", ")}) AND updated_ts < ${ts}`
+  );
+
+  const del = await supabase
+    .from("steam_topsellers_current_region")
+    .delete()
+    .in("cc", ccs)
+    .lt("updated_ts", ts);
+
+  if (del.error) {
+    log(`❌ CLEANUP FAILED: ${del.error.message}`);
+    throw del.error;
+  }
+
+  log(`✔ CLEANUP current_region done`);
 }
 
 /**
@@ -189,6 +216,11 @@ async function scrapePage({ cc, page, ts, rankRef }) {
 
       clearTimeout(timeout);
 
+      if (res.status === 429 || res.status === 503) {
+        await sleep(3000);
+        continue;
+      }
+
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
 
       const html = await res.text();
@@ -207,6 +239,8 @@ async function scrapePage({ cc, page, ts, rankRef }) {
       await sleep(3000);
     }
   }
+
+  return [];
 }
 
 /**
@@ -251,6 +285,8 @@ async function runSnapshot() {
   let current = [];
   let pages = [];
 
+  const regionCcs = REGIONS.map((r) => r.cc);
+
   for (let i = 0; i < REGIONS.length; i += CONCURRENCY) {
     const batch = REGIONS.slice(i, i + CONCURRENCY);
     log(`Processing regions: ${batch.map((r) => r.cc).join(", ")}`);
@@ -279,35 +315,24 @@ async function runSnapshot() {
   }
 
   // ===== PAGES =====
-  log(`PAGES upsert: ${pages.length}`);
   await supabase
     .from("steam_topsellers_pages_region")
     .upsert(pages, { onConflict: "cc" });
 
   // ===== HISTORY =====
-  await insertWithConcurrency(
-    "steam_topsellers_history_region",
-    chunkArray(history, CHUNK_SIZE)
-  );
+  await insertWithConcurrency("steam_topsellers_history_region", history);
 
-  // ===== CURRENT (FIX: REPLACE LIST) =====
-  const regionCodes = REGIONS.map((r) => r.cc);
-  log(`DELETE current_region for: ${regionCodes.join(", ")}`);
-
-  const del = await supabase
-    .from("steam_topsellers_current_region")
-    .delete()
-    .in("cc", regionCodes);
-
-  if (del.error) throw del.error;
-
+  // ===== CURRENT =====
   await upsertWithConcurrency(
     "steam_topsellers_current_region",
     current,
     "appid,cc"
   );
 
-  log(`===== SNAPSHOT DONE =====`);
+  // cleanup тільки для secondary cc
+  await cleanupCurrentForRegions({ ccs: regionCcs, ts });
+
+  log(`===== SNAPSHOT DONE ts=${ts} =====`);
 }
 
 /**
@@ -329,7 +354,7 @@ async function main() {
     try {
       await runSnapshot();
     } catch (e) {
-      log(`SNAPSHOT FAILED: ${e.message}`);
+      log(`SNAPSHOT FAILED: ${e?.message || e}`);
     } finally {
       running = false;
     }
