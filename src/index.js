@@ -79,52 +79,6 @@ function extractAppId(url) {
 
 /**
  * =====================================================
- * FIXED UTC SCHEDULER (05 15 25 35 45 55)
- * =====================================================
- */
-
-function getNextRunAtUTC(now = new Date()) {
-  const minutes = now.getUTCMinutes();
-  const hours = now.getUTCHours();
-  const slots = [5, 15, 25, 35, 45, 55];
-
-  for (const m of slots) {
-    if (minutes < m) {
-      return Date.UTC(
-        now.getUTCFullYear(),
-        now.getUTCMonth(),
-        now.getUTCDate(),
-        hours,
-        m,
-        0,
-        0
-      );
-    }
-  }
-
-  return Date.UTC(
-    now.getUTCFullYear(),
-    now.getUTCMonth(),
-    now.getUTCDate(),
-    hours + 1,
-    5,
-    0,
-    0
-  );
-}
-
-async function sleepUntil(ts) {
-  const ms = ts - Date.now();
-  if (ms > 0) {
-    log(
-      `Waiting until ${new Date(ts).toISOString()} (${Math.round(ms / 1000)}s)`
-    );
-    await sleep(ms);
-  }
-}
-
-/**
- * =====================================================
  * SCRAPER
  * =====================================================
  */
@@ -145,7 +99,6 @@ async function scrapePage({ cc, page, ts, rankRef }) {
       clearTimeout(timeoutId);
 
       if (res.status === 429 || res.status === 503) {
-        log(`Rate limit ${res.status}, retry ${attempt}`);
         await sleep(3000);
         continue;
       }
@@ -156,30 +109,19 @@ async function scrapePage({ cc, page, ts, rankRef }) {
       const $ = cheerio.load(html);
 
       const rows = [];
-
       $(".search_result_row").each((_, el) => {
         const appid = extractAppId($(el).attr("href"));
         if (!appid) return;
 
-        rows.push({
-          appid,
-          cc,
-          rank: rankRef.value++,
-          ts,
-        });
+        rows.push({ appid, cc, rank: rankRef.value++, ts });
       });
 
       return rows;
     } catch {
-      if (attempt === MAX_ATTEMPTS) {
-        log(`Page ${page} failed permanently`);
-        return [];
-      }
+      if (attempt === MAX_ATTEMPTS) return [];
       await sleep(3000);
     }
   }
-
-  return [];
 }
 
 /**
@@ -199,31 +141,19 @@ async function runSnapshotForRegion({ cc, ts }) {
     await sleep(PAGE_DELAY_MS);
 
     const pageRows = await scrapePage({ cc, page, ts, rankRef });
-
-    if (pageRows.length === 0) {
-      log(`Region ${cc}: stop at page ${page}`);
-      break;
-    }
+    if (pageRows.length === 0) break;
 
     steamPages = page;
     rows.push(...pageRows);
   }
 
   const unique = [...new Map(rows.map((r) => [r.appid, r])).values()];
-
-  if (unique.length < MIN_VALID_ITEMS_REGION) {
-    log(`Region ${cc}: skipped (${unique.length} items)`);
-    return null;
-  }
-
-  const frontendPages = steamPages * (STEAM_PAGE_SIZE / FRONT_PAGE_SIZE);
-
-  log(`Region ${cc}: steamPages=${steamPages}, frontendPages=${frontendPages}`);
+  if (unique.length < MIN_VALID_ITEMS_REGION) return null;
 
   return {
     rows,
     unique,
-    totalPages: frontendPages,
+    totalPages: steamPages * (STEAM_PAGE_SIZE / FRONT_PAGE_SIZE),
   };
 }
 
@@ -235,9 +165,6 @@ async function runSnapshotForRegion({ cc, ts }) {
 
 async function runSnapshot() {
   const ts = Math.floor(Date.now() / 1000);
-  const startedAt = Date.now();
-
-  log(`SNAPSHOT start ts=${ts}`);
 
   let historyRows = [];
   let currentRows = [];
@@ -245,30 +172,20 @@ async function runSnapshot() {
 
   for (let i = 0; i < REGIONS.length; i += CONCURRENCY) {
     const batch = REGIONS.slice(i, i + CONCURRENCY);
-    log(`Batch: ${batch.map((b) => b.cc).join(", ")}`);
-
     const results = await Promise.all(
       batch.map((r) => runSnapshotForRegion({ cc: r.cc, ts }))
     );
 
-    for (let j = 0; j < results.length; j++) {
-      const result = results[j];
-      if (!result) continue;
-
-      const cc = batch[j].cc;
-      const { rows, unique, totalPages } = result;
+    results.forEach((res, idx) => {
+      if (!res) return;
+      const cc = batch[idx].cc;
 
       historyRows.push(
-        ...rows.map(({ appid, cc, rank, ts }) => ({
-          appid,
-          cc,
-          rank,
-          ts,
-        }))
+        ...res.rows.map((r) => ({ ...r, ts }))
       );
 
       currentRows.push(
-        ...unique.map((r) => ({
+        ...res.unique.map((r) => ({
           appid: r.appid,
           cc,
           rank: r.rank,
@@ -278,31 +195,42 @@ async function runSnapshot() {
 
       pagesRows.push({
         cc,
-        total_pages: totalPages,
+        total_pages: res.totalPages,
         updated_ts: ts,
       });
-    }
+    });
   }
 
   // INSERT HISTORY
-  for (let i = 0; i < historyRows.length; i += CHUNK_SIZE) {
+  for (let i = 0; i < historyRows.length; i += CHUNK_SIZE)
     await supabase
       .from("steam_topsellers_history_region")
       .insert(historyRows.slice(i, i + CHUNK_SIZE));
-  }
 
   // UPSERT CURRENT
   await supabase
     .from("steam_topsellers_current_region")
     .upsert(currentRows, { onConflict: "appid,cc" });
 
-  // UPSERT TOTAL PAGES (10 items per page)
+  /**
+   * ===== 🔥 FIX: MERGE pages_region 🔥 =====
+   */
+
+  const { data: existing } = await supabase
+    .from("steam_topsellers_pages_region")
+    .select("cc, total_pages, updated_ts");
+
+  const map = new Map(existing?.map((r) => [r.cc, r]) ?? []);
+
+  for (const row of pagesRows) {
+    map.set(row.cc, row);
+  }
+
   await supabase
     .from("steam_topsellers_pages_region")
-    .upsert(pagesRows, { onConflict: "cc" });
+    .upsert([...map.values()], { onConflict: "cc" });
 
-  const duration = ((Date.now() - startedAt) / 1000).toFixed(1);
-  log(`SNAPSHOT done in ${duration}s`);
+  log("SNAPSHOT done");
 }
 
 /**
@@ -318,17 +246,11 @@ async function main() {
     const nextRunAt = getNextRunAtUTC(new Date());
     await sleepUntil(nextRunAt);
 
-    if (running) {
-      log("Previous snapshot still running — skipping slot");
-      continue;
-    }
-
+    if (running) continue;
     running = true;
 
     try {
       await runSnapshot();
-    } catch (err) {
-      log(`SNAPSHOT failed: ${err.message}`);
     } finally {
       running = false;
     }
