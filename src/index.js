@@ -78,7 +78,7 @@ function extractAppId(url) {
 function getNextRunAtUTC(now = new Date()) {
   const minutes = now.getUTCMinutes();
   const hours = now.getUTCHours();
-  const slots = [5, 15, 25, 35, 45, 55];
+  const slots = [0, 10, 20, 30, 40, 50];
 
   for (const m of slots) {
     if (minutes < m) {
