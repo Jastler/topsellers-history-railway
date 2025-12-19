@@ -153,7 +153,7 @@ async function runSnapshotForRegion({ cc, ts }) {
   return {
     rows,
     unique,
-    totalPages: steamPages * (STEAM_PAGE_SIZE / FRONT_PAGE_SIZE),
+    totalPages: Math.floor((steamPages * STEAM_PAGE_SIZE) / FRONT_PAGE_SIZE),
   };
 }
 
@@ -180,9 +180,7 @@ async function runSnapshot() {
       if (!res) return;
       const cc = batch[idx].cc;
 
-      historyRows.push(
-        ...res.rows.map((r) => ({ ...r, ts }))
-      );
+      historyRows.push(...res.rows.map((r) => ({ ...r, ts })));
 
       currentRows.push(
         ...res.unique.map((r) => ({
