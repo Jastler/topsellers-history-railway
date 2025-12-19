@@ -85,7 +85,7 @@ function chunkArray(arr, size) {
 function getNextRunAtUTC(now = new Date()) {
   const minutes = now.getUTCMinutes();
   const hours = now.getUTCHours();
-  const slots = [0, 10, 20, 30, 40, 50];
+  const slots = [5, 15, 25, 35, 45, 55];
 
   for (const m of slots) {
     if (minutes < m) {
@@ -115,7 +115,9 @@ function getNextRunAtUTC(now = new Date()) {
 async function sleepUntil(ts) {
   const ms = ts - Date.now();
   if (ms > 0) {
-    log(`Waiting ${Math.round(ms / 1000)}s`);
+    log(
+      `Waiting ${Math.round(ms / 1000)}s until ${new Date(ts).toISOString()}`
+    );
     await sleep(ms);
   }
 }
@@ -125,20 +127,32 @@ async function sleepUntil(ts) {
  */
 
 async function insertWithConcurrency(table, chunks) {
-  if (!chunks.length) return;
+  if (!chunks.length) {
+    log(`INSERT ${table}: nothing to insert`);
+    return;
+  }
 
-  log(`INSERT ${table}: ${chunks.length} chunks`);
+  log(
+    `INSERT ${table}: ${chunks.length} chunks (concurrency=${INSERT_CONCURRENCY})`
+  );
 
   for (let i = 0; i < chunks.length; i += INSERT_CONCURRENCY) {
     const batch = chunks.slice(i, i + INSERT_CONCURRENCY);
+    log(`→ INSERT ${table}: chunks ${i + 1} – ${i + batch.length}`);
+
     const results = await Promise.all(
       batch.map((chunk) => supabase.from(table).insert(chunk))
     );
 
     for (const r of results) {
-      if (r?.error) throw r.error;
+      if (r?.error) {
+        log(`❌ INSERT FAILED ${table}: ${r.error.message}`);
+        throw r.error;
+      }
     }
   }
+
+  log(`✔ INSERT ${table} done`);
 }
 
 /**
@@ -185,6 +199,8 @@ async function scrapePage({ cc, page, ts, rankRef }) {
  */
 
 async function runRegion({ cc, ts }) {
+  log(`Region ${cc}: start`);
+
   let rows = [];
   let rankRef = { value: 1 };
 
@@ -196,13 +212,17 @@ async function runRegion({ cc, ts }) {
   }
 
   const unique = [...new Map(rows.map((r) => [r.appid, r])).values()];
-  if (unique.length < MIN_VALID_ITEMS_REGION) return null;
 
-  return {
-    rows,
-    unique,
-    totalPages: Math.ceil(unique.length / FRONT_PAGE_SIZE),
-  };
+  if (unique.length < MIN_VALID_ITEMS_REGION) {
+    log(`Region ${cc}: skipped (${unique.length})`);
+    return null;
+  }
+
+  const totalPages = Math.ceil(unique.length / FRONT_PAGE_SIZE);
+
+  log(`Region ${cc}: items=${unique.length}, totalPages=${totalPages}`);
+
+  return { rows, unique, totalPages };
 }
 
 /**
@@ -211,7 +231,7 @@ async function runRegion({ cc, ts }) {
 
 async function runSnapshot() {
   const ts = Math.floor(Date.now() / 1000);
-  log(`SNAPSHOT start ts=${ts}`);
+  log(`===== SNAPSHOT START ts=${ts} =====`);
 
   let history = [];
   let current = [];
@@ -219,6 +239,8 @@ async function runSnapshot() {
 
   for (let i = 0; i < REGIONS.length; i += CONCURRENCY) {
     const batch = REGIONS.slice(i, i + CONCURRENCY);
+    log(`Processing regions: ${batch.map((r) => r.cc).join(", ")}`);
+
     const results = await Promise.all(
       batch.map((r) => runRegion({ cc: r.cc, ts }))
     );
@@ -230,6 +252,7 @@ async function runSnapshot() {
       const cc = batch[j].cc;
 
       history.push(...res.rows);
+
       current.push(
         ...res.unique.map((r) => ({
           appid: r.appid,
@@ -238,24 +261,33 @@ async function runSnapshot() {
           updated_ts: ts,
         }))
       );
+
       pages.push({ cc, total_pages: res.totalPages, updated_ts: ts });
     }
   }
 
-  await supabase
-    .from("steam_topsellers_pages_region")
-    .upsert(pages, { onConflict: "cc" });
+  log(`UPSERT pages: ${pages.length} rows`);
+  if (pages.length) {
+    const p = await supabase
+      .from("steam_topsellers_pages_region")
+      .upsert(pages, { onConflict: "cc" });
+    if (p.error) throw p.error;
+  }
 
   await insertWithConcurrency(
     "steam_topsellers_history_region",
     chunkArray(history, CHUNK_SIZE)
   );
 
-  await supabase
-    .from("steam_topsellers_current_region")
-    .upsert(current, { onConflict: "appid,cc" });
+  log(`UPSERT current_region: ${current.length} rows`);
+  if (current.length) {
+    const c = await supabase
+      .from("steam_topsellers_current_region")
+      .upsert(current, { onConflict: "appid,cc" });
+    if (c.error) throw c.error;
+  }
 
-  log("SNAPSHOT done");
+  log(`===== SNAPSHOT DONE =====`);
 }
 
 /**
@@ -267,11 +299,17 @@ async function main() {
 
   while (true) {
     await sleepUntil(getNextRunAtUTC());
-    if (running) continue;
+
+    if (running) {
+      log("Previous snapshot still running — skipping");
+      continue;
+    }
 
     running = true;
     try {
       await runSnapshot();
+    } catch (e) {
+      log(`SNAPSHOT FAILED: ${e.message}`);
     } finally {
       running = false;
     }
