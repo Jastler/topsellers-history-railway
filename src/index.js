@@ -16,7 +16,7 @@ const MAX_PAGES = 100;
 const PAGE_SIZE = 100;
 
 const PAGE_DELAY_MS = 30;
-const CONCURRENCY = 4; // можеш піднімати
+const CONCURRENCY = 4;
 
 const TIMEOUT_MS = 40000;
 const MAX_ATTEMPTS = 6;
@@ -77,7 +77,7 @@ function extractAppId(url) {
 
 /**
  * =====================================================
- * FIXED UTC SCHEDULER (05 15 25 35 45 55)
+ * FIXED UTC SCHEDULER
  * =====================================================
  */
 
@@ -191,6 +191,7 @@ async function runSnapshotForRegion({ cc, ts }) {
 
   let rows = [];
   let rankRef = { value: 1 };
+  let lastPage = 0;
 
   for (let page = 1; page <= MAX_PAGES; page++) {
     await sleep(PAGE_DELAY_MS);
@@ -202,6 +203,7 @@ async function runSnapshotForRegion({ cc, ts }) {
       break;
     }
 
+    lastPage = page;
     rows.push(...pageRows);
   }
 
@@ -212,8 +214,15 @@ async function runSnapshotForRegion({ cc, ts }) {
     return null;
   }
 
-  log(`Region ${cc}: rows=${rows.length}, unique=${unique.length}`);
-  return { rows, unique };
+  log(
+    `Region ${cc}: rows=${rows.length}, unique=${unique.length}, pages=${lastPage}`
+  );
+
+  return {
+    rows,
+    unique,
+    totalPages: lastPage,
+  };
 }
 
 /**
@@ -230,6 +239,7 @@ async function runSnapshot() {
 
   let historyRows = [];
   let currentRows = [];
+  let pagesRows = [];
 
   for (let i = 0; i < REGIONS.length; i += CONCURRENCY) {
     const batch = REGIONS.slice(i, i + CONCURRENCY);
@@ -244,7 +254,7 @@ async function runSnapshot() {
       if (!result) continue;
 
       const cc = batch[j].cc;
-      const { rows, unique } = result;
+      const { rows, unique, totalPages } = result;
 
       historyRows.push(
         ...rows.map(({ appid, cc, rank, ts }) => ({
@@ -263,6 +273,12 @@ async function runSnapshot() {
           updated_ts: ts,
         }))
       );
+
+      pagesRows.push({
+        cc,
+        total_pages: totalPages,
+        updated_ts: ts,
+      });
     }
   }
 
@@ -277,6 +293,11 @@ async function runSnapshot() {
   await supabase
     .from("steam_topsellers_current_region")
     .upsert(currentRows, { onConflict: "appid,cc" });
+
+  // UPSERT TOTAL PAGES PER REGION
+  await supabase
+    .from("steam_topsellers_pages_region")
+    .upsert(pagesRows, { onConflict: "cc" });
 
   const duration = ((Date.now() - startedAt) / 1000).toFixed(1);
   log(`SNAPSHOT done in ${duration}s`);
