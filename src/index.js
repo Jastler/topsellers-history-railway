@@ -24,7 +24,7 @@ const CHUNK_SIZE = 1000;
 const MIN_VALID_ITEMS_REGION = 500;
 
 /**
- * SECONDARY REGIONS
+ * SECONDARY REGIONS ONLY
  */
 const REGIONS = [
   { cc: "us" },
@@ -61,9 +61,7 @@ const supabase = createClient(
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-function log(msg) {
-  console.log(`[${new Date().toISOString()}] ${msg}`);
-}
+const log = (msg) => console.log(`[${new Date().toISOString()}] ${msg}`);
 
 function extractAppId(url) {
   const m = url?.match(/\/app\/(\d+)/);
@@ -72,7 +70,9 @@ function extractAppId(url) {
 
 function chunkArray(arr, size) {
   const out = [];
-  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
+  for (let i = 0; i < arr.length; i += size) {
+    out.push(arr.slice(i, i + size));
+  }
   return out;
 }
 
@@ -127,9 +127,7 @@ async function insertWithConcurrency(table, rows) {
   if (!rows.length) return;
 
   const chunks = chunkArray(rows, CHUNK_SIZE);
-  log(
-    `INSERT ${table}: ${rows.length} rows (${chunks.length} chunks, concurrency=${INSERT_CONCURRENCY})`
-  );
+  log(`INSERT ${table}: ${rows.length} rows (${chunks.length} chunks)`);
 
   for (let i = 0; i < chunks.length; i += INSERT_CONCURRENCY) {
     const batch = chunks.slice(i, i + INSERT_CONCURRENCY);
@@ -139,10 +137,7 @@ async function insertWithConcurrency(table, rows) {
     );
 
     for (const r of res) {
-      if (r?.error) {
-        log(`❌ INSERT FAILED ${table}: ${r.error.message}`);
-        throw r.error;
-      }
+      if (r?.error) throw r.error;
     }
   }
 
@@ -153,9 +148,7 @@ async function upsertWithConcurrency(table, rows, conflict) {
   if (!rows.length) return;
 
   const chunks = chunkArray(rows, CHUNK_SIZE);
-  log(
-    `UPSERT ${table}: ${rows.length} rows (${chunks.length} chunks, concurrency=${INSERT_CONCURRENCY})`
-  );
+  log(`UPSERT ${table}: ${rows.length} rows (${chunks.length} chunks)`);
 
   for (let i = 0; i < chunks.length; i += INSERT_CONCURRENCY) {
     const batch = chunks.slice(i, i + INSERT_CONCURRENCY);
@@ -165,10 +158,7 @@ async function upsertWithConcurrency(table, rows, conflict) {
     );
 
     for (const r of res) {
-      if (r?.error) {
-        log(`❌ UPSERT FAILED ${table}: ${r.error.message}`);
-        throw r.error;
-      }
+      if (r?.error) throw r.error;
     }
   }
 
@@ -176,12 +166,10 @@ async function upsertWithConcurrency(table, rows, conflict) {
 }
 
 /**
- * cleanup: видаляємо старі current ТІЛЬКИ для наших cc
+ * cleanup — тільки свої secondary cc
  */
 async function cleanupCurrentForRegions({ ccs, ts }) {
-  log(
-    `CLEANUP current_region: cc IN (${ccs.join(", ")}) AND updated_ts < ${ts}`
-  );
+  log(`CLEANUP current_region for [${ccs.join(", ")}]`);
 
   const del = await supabase
     .from("steam_topsellers_current_region")
@@ -189,10 +177,7 @@ async function cleanupCurrentForRegions({ ccs, ts }) {
     .in("cc", ccs)
     .lt("updated_ts", ts);
 
-  if (del.error) {
-    log(`❌ CLEANUP FAILED: ${del.error.message}`);
-    throw del.error;
-  }
+  if (del.error) throw del.error;
 
   log(`✔ CLEANUP current_region done`);
 }
@@ -248,8 +233,6 @@ async function scrapePage({ cc, page, ts, rankRef }) {
  */
 
 async function runRegion({ cc, ts }) {
-  log(`Region ${cc}: start`);
-
   let rows = [];
   let rankRef = { value: 1 };
 
@@ -262,15 +245,9 @@ async function runRegion({ cc, ts }) {
 
   const unique = [...new Map(rows.map((r) => [r.appid, r])).values()];
 
-  if (unique.length < MIN_VALID_ITEMS_REGION) {
-    log(`Region ${cc}: skipped (${unique.length})`);
-    return null;
-  }
+  if (unique.length < MIN_VALID_ITEMS_REGION) return null;
 
-  const totalPages = Math.ceil(unique.length / FRONT_PAGE_SIZE);
-  log(`Region ${cc}: items=${unique.length}, pages=${totalPages}`);
-
-  return { rows, unique, totalPages };
+  return { rows, unique };
 }
 
 /**
@@ -283,13 +260,11 @@ async function runSnapshot() {
 
   let history = [];
   let current = [];
-  let pages = [];
 
   const regionCcs = REGIONS.map((r) => r.cc);
 
   for (let i = 0; i < REGIONS.length; i += CONCURRENCY) {
     const batch = REGIONS.slice(i, i + CONCURRENCY);
-    log(`Processing regions: ${batch.map((r) => r.cc).join(", ")}`);
 
     const results = await Promise.all(
       batch.map((r) => runRegion({ cc: r.cc, ts }))
@@ -310,26 +285,17 @@ async function runSnapshot() {
           updated_ts: ts,
         }))
       );
-      pages.push({ cc, total_pages: res.totalPages, updated_ts: ts });
     }
   }
 
-  // ===== PAGES =====
-  await supabase
-    .from("steam_topsellers_pages_region")
-    .upsert(pages, { onConflict: "cc" });
-
-  // ===== HISTORY =====
   await insertWithConcurrency("steam_topsellers_history_region", history);
 
-  // ===== CURRENT =====
   await upsertWithConcurrency(
     "steam_topsellers_current_region",
     current,
     "appid,cc"
   );
 
-  // cleanup тільки для secondary cc
   await cleanupCurrentForRegions({ ccs: regionCcs, ts });
 
   log(`===== SNAPSHOT DONE ts=${ts} =====`);
@@ -345,10 +311,7 @@ async function main() {
   while (true) {
     await sleepUntil(getNextRunAtUTC());
 
-    if (running) {
-      log("Previous snapshot still running — skipping");
-      continue;
-    }
+    if (running) continue;
 
     running = true;
     try {
