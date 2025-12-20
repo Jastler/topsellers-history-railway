@@ -11,9 +11,8 @@ const BASE_URL =
   "https://store.steampowered.com/search/results/?query&count=100&ignore_preferences=1";
 
 const MAX_PAGES = 100;
-const FRONT_PAGE_SIZE = 10;
-
 const PAGE_DELAY_MS = 30;
+
 const CONCURRENCY = 4;
 const INSERT_CONCURRENCY = 2; // Supabase Micro-safe
 
@@ -25,6 +24,7 @@ const MIN_VALID_ITEMS_REGION = 500;
 
 /**
  * SECONDARY REGIONS ONLY
+ * (НЕ global, НЕ core)
  */
 const REGIONS = [
   { cc: "us" },
@@ -52,7 +52,10 @@ const REGIONS = [
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE,
-  { db: { schema: "analytics" } }
+  {
+    db: { schema: "analytics" },
+    auth: { persistSession: false },
+  }
 );
 
 /**
@@ -60,7 +63,6 @@ const supabase = createClient(
  */
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
 const log = (msg) => console.log(`[${new Date().toISOString()}] ${msg}`);
 
 function extractAppId(url) {
@@ -131,55 +133,38 @@ async function insertWithConcurrency(table, rows) {
 
   for (let i = 0; i < chunks.length; i += INSERT_CONCURRENCY) {
     const batch = chunks.slice(i, i + INSERT_CONCURRENCY);
-
     const res = await Promise.all(
       batch.map((c) => supabase.from(table).insert(c))
     );
-
-    for (const r of res) {
-      if (r?.error) throw r.error;
-    }
+    for (const r of res) if (r.error) throw r.error;
   }
 
   log(`✔ INSERT ${table} done`);
 }
 
-async function upsertWithConcurrency(table, rows, conflict) {
-  if (!rows.length) return;
-
-  const chunks = chunkArray(rows, CHUNK_SIZE);
-  log(`UPSERT ${table}: ${rows.length} rows (${chunks.length} chunks)`);
-
-  for (let i = 0; i < chunks.length; i += INSERT_CONCURRENCY) {
-    const batch = chunks.slice(i, i + INSERT_CONCURRENCY);
-
-    const res = await Promise.all(
-      batch.map((c) => supabase.from(table).upsert(c, { onConflict: conflict }))
-    );
-
-    for (const r of res) {
-      if (r?.error) throw r.error;
-    }
-  }
-
-  log(`✔ UPSERT ${table} done`);
-}
-
 /**
- * cleanup — тільки свої secondary cc
+ * cleanup:
+ * видаляємо СТАРІ snapshot-и
+ * ТІЛЬКИ для secondary cc
  */
-async function cleanupCurrentForRegions({ ccs, ts }) {
-  log(`CLEANUP current_region for [${ccs.join(", ")}]`);
+async function cleanupOldSnapshots({ ccs, keepTs }) {
+  if (!keepTs?.length) return;
+
+  log(
+    `CLEANUP secondary current_region: cc IN (${ccs.join(
+      ", "
+    )}), keep_ts=${keepTs.join(",")}`
+  );
 
   const del = await supabase
     .from("steam_topsellers_current_region")
     .delete()
     .in("cc", ccs)
-    .lt("updated_ts", ts);
+    .not("updated_ts", "in", `(${keepTs.join(",")})`);
 
   if (del.error) throw del.error;
 
-  log(`✔ CLEANUP current_region done`);
+  log(`✔ CLEANUP secondary current_region done`);
 }
 
 /**
@@ -244,7 +229,6 @@ async function runRegion({ cc, ts }) {
   }
 
   const unique = [...new Map(rows.map((r) => [r.appid, r])).values()];
-
   if (unique.length < MIN_VALID_ITEMS_REGION) return null;
 
   return { rows, unique };
@@ -288,15 +272,17 @@ async function runSnapshot() {
     }
   }
 
+  // history — append forever
   await insertWithConcurrency("steam_topsellers_history_region", history);
 
-  await upsertWithConcurrency(
-    "steam_topsellers_current_region",
-    current,
-    "appid,cc"
-  );
+  // current — append snapshot
+  await insertWithConcurrency("steam_topsellers_current_region", current);
 
-  await cleanupCurrentForRegions({ ccs: regionCcs, ts });
+  // залишаємо тільки ОСТАННІЙ snapshot цього скрипта
+  await cleanupOldSnapshots({
+    ccs: regionCcs,
+    keepTs: [ts],
+  });
 
   log(`===== SNAPSHOT DONE ts=${ts} =====`);
 }
