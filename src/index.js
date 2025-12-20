@@ -11,8 +11,9 @@ const BASE_URL =
   "https://store.steampowered.com/search/results/?query&count=100&ignore_preferences=1";
 
 const MAX_PAGES = 100;
-const PAGE_DELAY_MS = 30;
+const FRONT_PAGE_SIZE = 10;
 
+const PAGE_DELAY_MS = 30;
 const CONCURRENCY = 4;
 const INSERT_CONCURRENCY = 2; // Supabase Micro-safe
 
@@ -24,7 +25,6 @@ const MIN_VALID_ITEMS_REGION = 500;
 
 /**
  * SECONDARY REGIONS ONLY
- * (НЕ global, НЕ core)
  */
 const REGIONS = [
   { cc: "us" },
@@ -84,18 +84,18 @@ function chunkArray(arr, size) {
  */
 
 function getNextRunAtUTC(now = new Date()) {
-  const minutes = now.getUTCMinutes();
-  const hours = now.getUTCHours();
+  const m = now.getUTCMinutes();
+  const h = now.getUTCHours();
   const slots = [0, 10, 20, 30, 40, 50];
 
-  for (const m of slots) {
-    if (minutes < m) {
+  for (const s of slots) {
+    if (m < s) {
       return Date.UTC(
         now.getUTCFullYear(),
         now.getUTCMonth(),
         now.getUTCDate(),
-        hours,
-        m,
+        h,
+        s,
         0,
         0
       );
@@ -106,7 +106,7 @@ function getNextRunAtUTC(now = new Date()) {
     now.getUTCFullYear(),
     now.getUTCMonth(),
     now.getUTCDate(),
-    hours + 1,
+    h + 1,
     0,
     0,
     0
@@ -133,28 +133,46 @@ async function insertWithConcurrency(table, rows) {
 
   for (let i = 0; i < chunks.length; i += INSERT_CONCURRENCY) {
     const batch = chunks.slice(i, i + INSERT_CONCURRENCY);
+
     const res = await Promise.all(
       batch.map((c) => supabase.from(table).insert(c))
     );
-    for (const r of res) if (r.error) throw r.error;
+
+    for (const r of res) {
+      if (r?.error) throw r.error;
+    }
   }
 
   log(`✔ INSERT ${table} done`);
 }
 
+async function upsertWithConcurrency(table, rows, conflict) {
+  if (!rows.length) return;
+
+  const chunks = chunkArray(rows, CHUNK_SIZE);
+  log(`UPSERT ${table}: ${rows.length} rows (${chunks.length} chunks)`);
+
+  for (let i = 0; i < chunks.length; i += INSERT_CONCURRENCY) {
+    const batch = chunks.slice(i, i + INSERT_CONCURRENCY);
+
+    const res = await Promise.all(
+      batch.map((c) => supabase.from(table).upsert(c, { onConflict: conflict }))
+    );
+
+    for (const r of res) {
+      if (r?.error) throw r.error;
+    }
+  }
+
+  log(`✔ UPSERT ${table} done`);
+}
+
 /**
- * cleanup:
- * видаляємо СТАРІ snapshot-и
+ * cleanup — залишаємо тільки ОСТАННІЙ snapshot
  * ТІЛЬКИ для secondary cc
  */
 async function cleanupOldSnapshots({ ccs, keepTs }) {
-  if (!keepTs?.length) return;
-
-  log(
-    `CLEANUP secondary current_region: cc IN (${ccs.join(
-      ", "
-    )}), keep_ts=${keepTs.join(",")}`
-  );
+  log(`CLEANUP current_region secondary: keep ts=${keepTs.join(", ")}`);
 
   const del = await supabase
     .from("steam_topsellers_current_region")
@@ -231,7 +249,9 @@ async function runRegion({ cc, ts }) {
   const unique = [...new Map(rows.map((r) => [r.appid, r])).values()];
   if (unique.length < MIN_VALID_ITEMS_REGION) return null;
 
-  return { rows, unique };
+  const totalPages = Math.ceil(unique.length / FRONT_PAGE_SIZE);
+
+  return { rows, unique, totalPages };
 }
 
 /**
@@ -244,6 +264,7 @@ async function runSnapshot() {
 
   let history = [];
   let current = [];
+  let pages = [];
 
   const regionCcs = REGIONS.map((r) => r.cc);
 
@@ -261,6 +282,7 @@ async function runSnapshot() {
       const cc = batch[j].cc;
 
       history.push(...res.rows);
+
       current.push(
         ...res.unique.map((r) => ({
           appid: r.appid,
@@ -269,16 +291,25 @@ async function runSnapshot() {
           updated_ts: ts,
         }))
       );
+
+      pages.push({
+        cc,
+        total_pages: res.totalPages,
+        updated_ts: ts,
+      });
     }
   }
 
-  // history — append forever
+  // history — append
   await insertWithConcurrency("steam_topsellers_history_region", history);
 
   // current — append snapshot
   await insertWithConcurrency("steam_topsellers_current_region", current);
 
-  // залишаємо тільки ОСТАННІЙ snapshot цього скрипта
+  // pages — upsert per cc
+  await upsertWithConcurrency("steam_topsellers_pages_region", pages, "cc");
+
+  // cleanup — залишаємо тільки поточний snapshot
   await cleanupOldSnapshots({
     ccs: regionCcs,
     keepTs: [ts],
