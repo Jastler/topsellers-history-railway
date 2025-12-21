@@ -15,13 +15,20 @@ const FRONT_PAGE_SIZE = 10;
 
 const PAGE_DELAY_MS = 30;
 const CONCURRENCY = 4;
-const INSERT_CONCURRENCY = 1; // ↓ ЗМЕНШЕНО ДЛЯ IO
+const INSERT_CONCURRENCY = 1; 
 
 const TIMEOUT_MS = 40000;
 const MAX_ATTEMPTS = 6;
 const CHUNK_SIZE = 500;
 
 const MIN_VALID_ITEMS_REGION = 500;
+
+/**
+ * CLEANUP tuning (КЛЮЧОВЕ)
+ */
+const CLEANUP_BATCH_SIZE = 300;
+const CLEANUP_DELAY_MS = 200;
+const CLEANUP_MAX_LOOPS = 500;
 
 /**
  * SECONDARY REGIONS ONLY
@@ -125,7 +132,7 @@ async function sleepUntil(ts) {
  * cleanup тільки раз на годину
  */
 function shouldCleanup(ts) {
-  return ts % 3600 < 300; // перші 5 хв кожної години
+  return ts % 3600 < 300; // перші 5 хв години
 }
 
 /**
@@ -140,15 +147,11 @@ async function insertWithConcurrency(table, rows) {
 
   for (let i = 0; i < chunks.length; i += INSERT_CONCURRENCY) {
     const batch = chunks.slice(i, i + INSERT_CONCURRENCY);
-
     const res = await Promise.all(
       batch.map((c) => supabase.from(table).insert(c))
     );
-
     for (const r of res) if (r?.error) throw r.error;
   }
-
-  log(`✔ INSERT ${table} done`);
 }
 
 async function upsertWithConcurrency(table, rows, conflict) {
@@ -159,33 +162,52 @@ async function upsertWithConcurrency(table, rows, conflict) {
 
   for (let i = 0; i < chunks.length; i += INSERT_CONCURRENCY) {
     const batch = chunks.slice(i, i + INSERT_CONCURRENCY);
-
     const res = await Promise.all(
       batch.map((c) => supabase.from(table).upsert(c, { onConflict: conflict }))
     );
-
     for (const r of res) if (r?.error) throw r.error;
   }
-
-  log(`✔ UPSERT ${table} done`);
 }
 
 /**
- * cleanup — залишаємо тільки ОСТАННІЙ snapshot
- * (через < updated_ts, а не NOT IN)
+ * ================= CLEANUP (CHUNKED) =================
  */
-async function cleanupOldSnapshots({ ccs, ts }) {
-  log(`CLEANUP secondary current_region < ${ts}`);
 
-  const del = await supabase
-    .from("steam_topsellers_current_region")
-    .delete()
-    .in("cc", ccs)
-    .lt("updated_ts", ts);
+async function cleanupOldSnapshotsChunked({ ccs, ts }) {
+  log(`CLEANUP chunked: secondary current_region < ${ts}`);
 
-  if (del.error) throw del.error;
+  let loops = 0;
+  let total = 0;
 
-  log(`✔ CLEANUP secondary current_region done`);
+  while (loops < CLEANUP_MAX_LOOPS) {
+    const { data, error } = await supabase
+      .from("steam_topsellers_current_region")
+      .select("id")
+      .in("cc", ccs)
+      .lt("updated_ts", ts)
+      .limit(CLEANUP_BATCH_SIZE);
+
+    if (error) throw error;
+    if (!data || data.length === 0) break;
+
+    const ids = data.map((r) => r.id);
+
+    const del = await supabase
+      .from("steam_topsellers_current_region")
+      .delete()
+      .in("id", ids);
+
+    if (del.error) throw del.error;
+
+    total += ids.length;
+    loops++;
+
+    log(`CLEANUP deleted ${ids.length}, total=${total}`);
+
+    await sleep(CLEANUP_DELAY_MS);
+  }
+
+  log(`✔ CLEANUP DONE, total deleted=${total}`);
 }
 
 /**
@@ -273,7 +295,6 @@ async function runSnapshot() {
 
   for (let i = 0; i < REGIONS.length; i += CONCURRENCY) {
     const batch = REGIONS.slice(i, i + CONCURRENCY);
-
     const results = await Promise.all(
       batch.map((r) => runRegion({ cc: r.cc, ts }))
     );
@@ -305,11 +326,10 @@ async function runSnapshot() {
 
   await insertWithConcurrency("steam_topsellers_history_region", history);
   await insertWithConcurrency("steam_topsellers_current_region", current);
-
   await upsertWithConcurrency("steam_topsellers_pages_region", pages, "cc");
 
   if (shouldCleanup(ts)) {
-    await cleanupOldSnapshots({ ccs: regionCcs, ts });
+    await cleanupOldSnapshotsChunked({ ccs: regionCcs, ts });
   } else {
     log("CLEANUP skipped (not scheduled)");
   }
