@@ -15,11 +15,11 @@ const FRONT_PAGE_SIZE = 10;
 
 const PAGE_DELAY_MS = 30;
 const CONCURRENCY = 4;
-const INSERT_CONCURRENCY = 2; // Supabase Micro-safe
+const INSERT_CONCURRENCY = 1; // ↓ ЗМЕНШЕНО ДЛЯ IO
 
 const TIMEOUT_MS = 40000;
 const MAX_ATTEMPTS = 6;
-const CHUNK_SIZE = 1000;
+const CHUNK_SIZE = 500;
 
 const MIN_VALID_ITEMS_REGION = 500;
 
@@ -122,6 +122,13 @@ async function sleepUntil(ts) {
 }
 
 /**
+ * cleanup тільки раз на годину
+ */
+function shouldCleanup(ts) {
+  return ts % 3600 < 300; // перші 5 хв кожної години
+}
+
+/**
  * ================= DB HELPERS =================
  */
 
@@ -138,9 +145,7 @@ async function insertWithConcurrency(table, rows) {
       batch.map((c) => supabase.from(table).insert(c))
     );
 
-    for (const r of res) {
-      if (r?.error) throw r.error;
-    }
+    for (const r of res) if (r?.error) throw r.error;
   }
 
   log(`✔ INSERT ${table} done`);
@@ -159,9 +164,7 @@ async function upsertWithConcurrency(table, rows, conflict) {
       batch.map((c) => supabase.from(table).upsert(c, { onConflict: conflict }))
     );
 
-    for (const r of res) {
-      if (r?.error) throw r.error;
-    }
+    for (const r of res) if (r?.error) throw r.error;
   }
 
   log(`✔ UPSERT ${table} done`);
@@ -169,16 +172,16 @@ async function upsertWithConcurrency(table, rows, conflict) {
 
 /**
  * cleanup — залишаємо тільки ОСТАННІЙ snapshot
- * ТІЛЬКИ для secondary cc
+ * (через < updated_ts, а не NOT IN)
  */
-async function cleanupOldSnapshots({ ccs, keepTs }) {
-  log(`CLEANUP current_region secondary: keep ts=${keepTs.join(", ")}`);
+async function cleanupOldSnapshots({ ccs, ts }) {
+  log(`CLEANUP secondary current_region < ${ts}`);
 
   const del = await supabase
     .from("steam_topsellers_current_region")
     .delete()
     .in("cc", ccs)
-    .not("updated_ts", "in", `(${keepTs.join(",")})`);
+    .lt("updated_ts", ts);
 
   if (del.error) throw del.error;
 
@@ -300,20 +303,16 @@ async function runSnapshot() {
     }
   }
 
-  // history — append
   await insertWithConcurrency("steam_topsellers_history_region", history);
-
-  // current — append snapshot
   await insertWithConcurrency("steam_topsellers_current_region", current);
 
-  // pages — upsert per cc
   await upsertWithConcurrency("steam_topsellers_pages_region", pages, "cc");
 
-  // cleanup — залишаємо тільки поточний snapshot
-  await cleanupOldSnapshots({
-    ccs: regionCcs,
-    keepTs: [ts],
-  });
+  if (shouldCleanup(ts)) {
+    await cleanupOldSnapshots({ ccs: regionCcs, ts });
+  } else {
+    log("CLEANUP skipped (not scheduled)");
+  }
 
   log(`===== SNAPSHOT DONE ts=${ts} =====`);
 }
