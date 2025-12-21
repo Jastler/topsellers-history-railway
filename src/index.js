@@ -15,7 +15,7 @@ const FRONT_PAGE_SIZE = 10;
 
 const PAGE_DELAY_MS = 30;
 const CONCURRENCY = 4;
-const INSERT_CONCURRENCY = 1; 
+const INSERT_CONCURRENCY = 1;
 
 const TIMEOUT_MS = 40000;
 const MAX_ATTEMPTS = 6;
@@ -68,6 +68,8 @@ const supabase = createClient(
 /**
  * ================= HELPERS =================
  */
+
+let runCounter = 0;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const log = (msg) => console.log(`[${new Date().toISOString()}] ${msg}`);
@@ -129,13 +131,6 @@ async function sleepUntil(ts) {
 }
 
 /**
- * cleanup тільки раз на годину
- */
-function shouldCleanup(ts) {
-  return ts % 3600 < 300; // перші 5 хв години
-}
-
-/**
  * ================= DB HELPERS =================
  */
 
@@ -173,37 +168,34 @@ async function upsertWithConcurrency(table, rows, conflict) {
  * ================= CLEANUP (CHUNKED) =================
  */
 
-async function cleanupOldSnapshotsChunked({ ccs, ts }) {
-  log(`CLEANUP chunked: secondary current_region < ${ts}`);
+async function cleanupOldSnapshotsChunked({ ccs, minTs }) {
+  log(`🧹 CLEANUP chunked secondary < ${minTs}`);
 
   let loops = 0;
   let total = 0;
 
   while (loops < CLEANUP_MAX_LOOPS) {
-    const { data, error } = await supabase
+    const { data } = await supabase
       .from("steam_topsellers_current_region")
       .select("id")
       .in("cc", ccs)
-      .lt("updated_ts", ts)
+      .lt("updated_ts", minTs)
       .limit(CLEANUP_BATCH_SIZE);
 
-    if (error) throw error;
-    if (!data || data.length === 0) break;
+    if (!data?.length) break;
 
-    const ids = data.map((r) => r.id);
-
-    const del = await supabase
+    await supabase
       .from("steam_topsellers_current_region")
       .delete()
-      .in("id", ids);
+      .in(
+        "id",
+        data.map((r) => r.id)
+      );
 
-    if (del.error) throw del.error;
-
-    total += ids.length;
+    total += data.length;
     loops++;
 
-    log(`CLEANUP deleted ${ids.length}, total=${total}`);
-
+    log(`CLEANUP deleted ${data.length}, total=${total}`);
     await sleep(CLEANUP_DELAY_MS);
   }
 
@@ -228,22 +220,14 @@ async function scrapePage({ cc, page, ts, rankRef }) {
       });
 
       clearTimeout(timeout);
-
-      if (res.status === 429 || res.status === 503) {
-        await sleep(3000);
-        continue;
-      }
-
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
 
-      const html = await res.text();
-      const $ = cheerio.load(html);
-
+      const $ = cheerio.load(await res.text());
       const rows = [];
+
       $(".search_result_row").each((_, el) => {
         const appid = extractAppId($(el).attr("href"));
-        if (!appid) return;
-        rows.push({ appid, cc, rank: rankRef.value++, ts });
+        if (appid) rows.push({ appid, cc, rank: rankRef.value++, ts });
       });
 
       return rows;
@@ -252,8 +236,6 @@ async function scrapePage({ cc, page, ts, rankRef }) {
       await sleep(3000);
     }
   }
-
-  return [];
 }
 
 /**
@@ -265,18 +247,20 @@ async function runRegion({ cc, ts }) {
   let rankRef = { value: 1 };
 
   for (let page = 1; page <= MAX_PAGES; page++) {
-    await sleep(PAGE_DELAY_MS);
     const pageRows = await scrapePage({ cc, page, ts, rankRef });
-    if (!pageRows.length) break;
+    if (!pageRows?.length) break;
     rows.push(...pageRows);
+    await sleep(PAGE_DELAY_MS);
   }
 
   const unique = [...new Map(rows.map((r) => [r.appid, r])).values()];
   if (unique.length < MIN_VALID_ITEMS_REGION) return null;
 
-  const totalPages = Math.ceil(unique.length / FRONT_PAGE_SIZE);
-
-  return { rows, unique, totalPages };
+  return {
+    rows,
+    unique,
+    totalPages: Math.ceil(unique.length / FRONT_PAGE_SIZE),
+  };
 }
 
 /**
@@ -284,8 +268,10 @@ async function runRegion({ cc, ts }) {
  */
 
 async function runSnapshot() {
+  runCounter++;
   const ts = Math.floor(Date.now() / 1000);
-  log(`===== SNAPSHOT START ts=${ts} =====`);
+
+  log(`===== SNAPSHOT #${runCounter} START ts=${ts} =====`);
 
   let history = [];
   let current = [];
@@ -299,11 +285,9 @@ async function runSnapshot() {
       batch.map((r) => runRegion({ cc: r.cc, ts }))
     );
 
-    for (let j = 0; j < results.length; j++) {
-      const res = results[j];
-      if (!res) continue;
-
-      const cc = batch[j].cc;
+    results.forEach((res, idx) => {
+      if (!res) return;
+      const cc = batch[idx].cc;
 
       history.push(...res.rows);
 
@@ -321,17 +305,24 @@ async function runSnapshot() {
         total_pages: res.totalPages,
         updated_ts: ts,
       });
-    }
+    });
   }
 
   await insertWithConcurrency("steam_topsellers_history_region", history);
   await insertWithConcurrency("steam_topsellers_current_region", current);
   await upsertWithConcurrency("steam_topsellers_pages_region", pages, "cc");
 
-  if (shouldCleanup(ts)) {
-    await cleanupOldSnapshotsChunked({ ccs: regionCcs, ts });
+  /**
+   * CLEANUP — кожен 6-й запуск
+   */
+  if (runCounter % 6 === 0) {
+    log("🧹 CLEANUP triggered (every 6th run)");
+    await cleanupOldSnapshotsChunked({
+      ccs: regionCcs,
+      minTs: ts,
+    });
   } else {
-    log("CLEANUP skipped (not scheduled)");
+    log("CLEANUP skipped (not 6th run)");
   }
 
   log(`===== SNAPSHOT DONE ts=${ts} =====`);
