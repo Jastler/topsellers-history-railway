@@ -12,10 +12,7 @@ const BASE_URL =
 
 const MAX_PAGES = 100;
 const FRONT_PAGE_SIZE = 10;
-
 const PAGE_DELAY_MS = 30;
-const CONCURRENCY = 4;
-const INSERT_CONCURRENCY = 1;
 
 const TIMEOUT_MS = 40000;
 const MAX_ATTEMPTS = 6;
@@ -24,32 +21,13 @@ const CHUNK_SIZE = 500;
 const MIN_VALID_ITEMS_REGION = 500;
 
 /**
- * CLEANUP tuning (КЛЮЧОВЕ)
+ * 🔁 REGION ROTATION GROUPS (10 хв / група)
  */
-const CLEANUP_BATCH_SIZE = 300;
-const CLEANUP_DELAY_MS = 200;
-const CLEANUP_MAX_LOOPS = 500;
-
-/**
- * SECONDARY REGIONS ONLY
- */
-const REGIONS = [
-  { cc: "us" },
-  { cc: "at" },
-  { cc: "au" },
-  { cc: "be" },
-  { cc: "br" },
-  { cc: "ch" },
-  { cc: "cz" },
-  { cc: "dk" },
-  { cc: "gb" },
-  { cc: "hk" },
-  { cc: "jp" },
-  { cc: "kr" },
-  { cc: "nz" },
-  { cc: "se" },
-  { cc: "sg" },
-  { cc: "tw" },
+const REGION_GROUPS = [
+  ["us", "uk", "fr", "de", "pl", "es", "it"],
+  ["nl", "be", "at", "ch", "dk", "se", "no"],
+  ["fi", "tr", "cz", "sk", "hu", "ro", "bg"],
+  ["jp", "kr", "tw", "hk", "sg", "th", "au"],
 ];
 
 /**
@@ -69,10 +47,11 @@ const supabase = createClient(
  * ================= HELPERS =================
  */
 
-let runCounter = 0;
-
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const log = (msg) => console.log(`[${new Date().toISOString()}] ${msg}`);
+
+function log(msg) {
+  console.log(`[${new Date().toISOString()}] ${msg}`);
+}
 
 function extractAppId(url) {
   const m = url?.match(/\/app\/(\d+)/);
@@ -88,118 +67,42 @@ function chunkArray(arr, size) {
 }
 
 /**
- * ================= UTC SCHEDULER =================
- * 00 10 20 30 40 50
+ * 🕒 визначаємо групу країн по UTC-хвилинах
  */
-
-function getNextRunAtUTC(now = new Date()) {
-  const m = now.getUTCMinutes();
-  const h = now.getUTCHours();
-  const slots = [0, 10, 20, 30, 40, 50];
-
-  for (const s of slots) {
-    if (m < s) {
-      return Date.UTC(
-        now.getUTCFullYear(),
-        now.getUTCMonth(),
-        now.getUTCDate(),
-        h,
-        s,
-        0,
-        0
-      );
-    }
-  }
-
-  return Date.UTC(
-    now.getUTCFullYear(),
-    now.getUTCMonth(),
-    now.getUTCDate(),
-    h + 1,
-    0,
-    0,
-    0
-  );
-}
-
-async function sleepUntil(ts) {
-  const ms = ts - Date.now();
-  if (ms > 0) {
-    log(`Waiting ${Math.round(ms / 1000)}s`);
-    await sleep(ms);
-  }
+function getRegionGroup() {
+  const m = new Date().getUTCMinutes();
+  const idx = Math.floor(m / 10) % REGION_GROUPS.length;
+  return { idx, ccs: REGION_GROUPS[idx] };
 }
 
 /**
  * ================= DB HELPERS =================
  */
 
-async function insertWithConcurrency(table, rows) {
+async function insertChunked(table, rows) {
   if (!rows.length) return;
 
   const chunks = chunkArray(rows, CHUNK_SIZE);
   log(`INSERT ${table}: ${rows.length} rows (${chunks.length} chunks)`);
 
-  for (let i = 0; i < chunks.length; i += INSERT_CONCURRENCY) {
-    const batch = chunks.slice(i, i + INSERT_CONCURRENCY);
-    const res = await Promise.all(
-      batch.map((c) => supabase.from(table).insert(c))
-    );
-    for (const r of res) if (r?.error) throw r.error;
+  for (let i = 0; i < chunks.length; i++) {
+    const { error } = await supabase.from(table).insert(chunks[i]);
+    if (error) throw error;
   }
+
+  log(`✔ INSERT ${table} done`);
 }
 
-async function upsertWithConcurrency(table, rows, conflict) {
+async function upsertPages(rows) {
   if (!rows.length) return;
 
-  const chunks = chunkArray(rows, CHUNK_SIZE);
-  log(`UPSERT ${table}: ${rows.length} rows (${chunks.length} chunks)`);
+  const { error } = await supabase
+    .from("steam_topsellers_pages_region")
+    .upsert(rows, { onConflict: "cc" });
 
-  for (let i = 0; i < chunks.length; i += INSERT_CONCURRENCY) {
-    const batch = chunks.slice(i, i + INSERT_CONCURRENCY);
-    const res = await Promise.all(
-      batch.map((c) => supabase.from(table).upsert(c, { onConflict: conflict }))
-    );
-    for (const r of res) if (r?.error) throw r.error;
-  }
-}
+  if (error) throw error;
 
-/**
- * ================= CLEANUP (CHUNKED) =================
- */
-
-async function cleanupOldSnapshotsChunked({ ccs, minTs }) {
-  log(`🧹 CLEANUP chunked secondary < ${minTs}`);
-
-  let loops = 0;
-  let total = 0;
-
-  while (loops < CLEANUP_MAX_LOOPS) {
-    const { data } = await supabase
-      .from("steam_topsellers_current_region")
-      .select("id")
-      .in("cc", ccs)
-      .lt("updated_ts", minTs)
-      .limit(CLEANUP_BATCH_SIZE);
-
-    if (!data?.length) break;
-
-    await supabase
-      .from("steam_topsellers_current_region")
-      .delete()
-      .in(
-        "id",
-        data.map((r) => r.id)
-      );
-
-    total += data.length;
-    loops++;
-
-    log(`CLEANUP deleted ${data.length}, total=${total}`);
-    await sleep(CLEANUP_DELAY_MS);
-  }
-
-  log(`✔ CLEANUP DONE, total deleted=${total}`);
+  log(`✔ pages updated (${rows.length})`);
 }
 
 /**
@@ -227,12 +130,22 @@ async function scrapePage({ cc, page, ts, rankRef }) {
 
       $(".search_result_row").each((_, el) => {
         const appid = extractAppId($(el).attr("href"));
-        if (appid) rows.push({ appid, cc, rank: rankRef.value++, ts });
+        if (appid) {
+          rows.push({
+            appid,
+            cc,
+            rank: rankRef.value++,
+            ts,
+          });
+        }
       });
 
       return rows;
     } catch {
-      if (attempt === MAX_ATTEMPTS) return [];
+      if (attempt === MAX_ATTEMPTS) {
+        log(`❌ ${cc} page ${page} failed`);
+        return [];
+      }
       await sleep(3000);
     }
   }
@@ -248,17 +161,21 @@ async function runRegion({ cc, ts }) {
 
   for (let page = 1; page <= MAX_PAGES; page++) {
     const pageRows = await scrapePage({ cc, page, ts, rankRef });
-    if (!pageRows?.length) break;
+    if (!pageRows.length) break;
+
     rows.push(...pageRows);
     await sleep(PAGE_DELAY_MS);
   }
 
   const unique = [...new Map(rows.map((r) => [r.appid, r])).values()];
-  if (unique.length < MIN_VALID_ITEMS_REGION) return null;
+
+  if (unique.length < MIN_VALID_ITEMS_REGION) {
+    log(`⚠️ ${cc}: too few items (${unique.length}), skipped`);
+    return null;
+  }
 
   return {
     rows,
-    unique,
     totalPages: Math.ceil(unique.length / FRONT_PAGE_SIZE),
   };
 }
@@ -268,62 +185,63 @@ async function runRegion({ cc, ts }) {
  */
 
 async function runSnapshot() {
-  runCounter++;
   const ts = Math.floor(Date.now() / 1000);
+  const { idx, ccs } = getRegionGroup();
 
-  log(`===== SNAPSHOT #${runCounter} START ts=${ts} =====`);
+  log(
+    `===== SNAPSHOT START ts=${ts} | group=${idx} | ccs=[${ccs.join(
+      ", "
+    )}] =====`
+  );
 
   let history = [];
-  let current = [];
   let pages = [];
 
-  const regionCcs = REGIONS.map((r) => r.cc);
+  for (const cc of ccs) {
+    log(`→ scraping ${cc}`);
 
-  for (let i = 0; i < REGIONS.length; i += CONCURRENCY) {
-    const batch = REGIONS.slice(i, i + CONCURRENCY);
-    const results = await Promise.all(
-      batch.map((r) => runRegion({ cc: r.cc, ts }))
-    );
+    const res = await runRegion({ cc, ts });
+    if (!res) continue;
 
-    results.forEach((res, idx) => {
-      if (!res) return;
-      const cc = batch[idx].cc;
-
-      history.push(...res.rows);
-
-      current.push(
-        ...res.unique.map((r) => ({
-          appid: r.appid,
-          cc,
-          rank: r.rank,
-          updated_ts: ts,
-        }))
-      );
-
-      pages.push({
-        cc,
-        total_pages: res.totalPages,
-        updated_ts: ts,
-      });
+    history.push(...res.rows);
+    pages.push({
+      cc,
+      total_pages: res.totalPages,
+      updated_ts: ts,
     });
   }
 
-  await insertWithConcurrency("steam_topsellers_history_region", history);
-  await insertWithConcurrency("steam_topsellers_current_region", current);
-  await upsertWithConcurrency("steam_topsellers_pages_region", pages, "cc");
+  if (!history.length) {
+    log("❌ No valid regions scraped, aborting snapshot");
+    return;
+  }
 
   /**
-   * CLEANUP — кожен 6-й запуск
+   * HISTORY
    */
-  if (runCounter % 6 === 0) {
-    log("🧹 CLEANUP triggered (every 6th run)");
-    await cleanupOldSnapshotsChunked({
-      ccs: regionCcs,
-      minTs: ts,
-    });
-  } else {
-    log("CLEANUP skipped (not 6th run)");
-  }
+  await insertChunked("steam_topsellers_history_region", history);
+
+  /**
+   * PAGES
+   */
+  await upsertPages(pages);
+
+  /**
+   * CURRENT (partial refresh for this group)
+   */
+  log(`🔄 refreshing current for ${ccs.length} countries`);
+
+  const { error } = await supabase.rpc(
+    "refresh_topsellers_current_region_for_ccs",
+    {
+      ccs,
+      snapshot_ts: ts,
+    }
+  );
+
+  if (error) throw error;
+
+  log(`✔ current refreshed for group`);
 
   log(`===== SNAPSHOT DONE ts=${ts} =====`);
 }
@@ -333,20 +251,20 @@ async function runSnapshot() {
  */
 
 async function main() {
-  let running = false;
-
   while (true) {
-    await sleepUntil(getNextRunAtUTC());
+    const now = new Date();
+    const next = new Date(now);
+    next.setUTCMinutes(Math.ceil(now.getUTCMinutes() / 10) * 10);
+    next.setUTCSeconds(0);
 
-    if (running) continue;
+    const wait = next - now;
+    log(`Waiting ${Math.round(wait / 1000)}s`);
+    await sleep(wait);
 
-    running = true;
     try {
       await runSnapshot();
     } catch (e) {
-      log(`SNAPSHOT FAILED: ${e?.message || e}`);
-    } finally {
-      running = false;
+      log(`❌ SNAPSHOT FAILED: ${e.message}`);
     }
   }
 }
