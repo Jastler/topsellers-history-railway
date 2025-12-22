@@ -93,6 +93,23 @@ async function insertChunked(table, rows) {
   log(`✔ INSERT ${table} done`);
 }
 
+async function upsertChunked(table, rows, conflict) {
+  if (!rows.length) return;
+
+  const chunks = chunkArray(rows, CHUNK_SIZE);
+  log(`UPSERT ${table}: ${rows.length} rows (${chunks.length} chunks)`);
+
+  for (let i = 0; i < chunks.length; i++) {
+    const { error } = await supabase
+      .from(table)
+      .upsert(chunks[i], { onConflict: conflict });
+
+    if (error) throw error;
+  }
+
+  log(`✔ UPSERT ${table} done`);
+}
+
 async function upsertPages(rows) {
   if (!rows.length) return;
 
@@ -175,7 +192,13 @@ async function runRegion({ cc, ts }) {
   }
 
   return {
-    rows,
+    history: rows,
+    current: unique.map((r) => ({
+      cc,
+      appid: r.appid,
+      rank: r.rank,
+      updated_ts: ts,
+    })),
     totalPages: Math.ceil(unique.length / FRONT_PAGE_SIZE),
   };
 }
@@ -195,6 +218,7 @@ async function runSnapshot() {
   );
 
   let history = [];
+  let current = [];
   let pages = [];
 
   for (const cc of ccs) {
@@ -203,7 +227,8 @@ async function runSnapshot() {
     const res = await runRegion({ cc, ts });
     if (!res) continue;
 
-    history.push(...res.rows);
+    history.push(...res.history);
+    current.push(...res.current);
     pages.push({
       cc,
       total_pages: res.totalPages,
@@ -219,31 +244,29 @@ async function runSnapshot() {
   /**
    * HISTORY
    */
-  await insertChunked("steam_topsellers_history_region", history);
+  await insertChunked(
+    "steam_topsellers_history_region",
+    history.map((r) => ({
+      appid: r.appid,
+      cc: r.cc,
+      rank: r.rank,
+      ts: r.ts,
+    }))
+  );
+
+  /**
+   * CURRENT (UPSERT)
+   */
+  await upsertChunked("steam_topsellers_current_region", current, "cc,appid");
 
   /**
    * PAGES
    */
   await upsertPages(pages);
 
-  /**
-   * CURRENT (partial refresh for this group)
-   */
-  log(`🔄 refreshing current for ${ccs.length} countries`);
-
-  const { error } = await supabase.rpc(
-    "refresh_topsellers_current_region_for_ccs",
-    {
-      ccs,
-      snapshot_ts: ts,
-    }
+  log(
+    `===== SNAPSHOT DONE ts=${ts} | history=${history.length} | current=${current.length} =====`
   );
-
-  if (error) throw error;
-
-  log(`✔ current refreshed for group`);
-
-  log(`===== SNAPSHOT DONE ts=${ts} =====`);
 }
 
 /**
