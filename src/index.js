@@ -24,10 +24,11 @@ const MIN_VALID_ITEMS_REGION = 500;
  * 🔁 REGION ROTATION GROUPS (10 хв / група)
  */
 const REGION_GROUPS = [
-  ["us", "gb", "de", "fr", "pl", "uk", "tr"],
-  ["es", "it", "nl", "ca", "au", "jp", "kr"],
-  ["br", "se", "dk", "no", "fi", "ch", "at"],
-  ["be", "cz", "hk", "sg", "tw", "nz", "th", "ru"],
+  ["us", "gb", "de", "fr", "pl", "ru"],
+  ["uk", "tr", "es", "it", "nl", "th"],
+  ["ca", "au", "jp", "kr", "br", "nz"],
+  ["se", "dk", "no", "fi", "ch", "tw"],
+  ["at", "be", "cz", "hk", "sg"],
 ];
 /**
  * ================= SUPABASE =================
