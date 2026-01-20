@@ -94,23 +94,6 @@ async function insertChunked(table, rows) {
   log(`✔ INSERT ${table} done`);
 }
 
-async function upsertChunked(table, rows, conflict) {
-  if (!rows.length) return;
-
-  const chunks = chunkArray(rows, CHUNK_SIZE);
-  log(`UPSERT ${table}: ${rows.length} rows (${chunks.length} chunks)`);
-
-  for (const chunk of chunks) {
-    const { error } = await supabase
-      .from(table)
-      .upsert(chunk, { onConflict: conflict });
-
-    if (error) throw error;
-  }
-
-  log(`✔ UPSERT ${table} done`);
-}
-
 async function upsertPages(rows) {
   if (!rows.length) return;
 
@@ -124,10 +107,24 @@ async function upsertPages(rows) {
 }
 
 /**
+ * 🔴 КРИТИЧНО: очищення current для одного регіону
+ */
+async function clearCurrentRegion(cc) {
+  log(`🧹 Clearing current_region for cc=${cc}`);
+
+  const { error } = await supabase
+    .from("steam_topsellers_current_region")
+    .delete()
+    .eq("cc", cc);
+
+  if (error) throw error;
+}
+
+/**
  * ================= SCRAPER =================
  */
 
-async function scrapePage({ cc, page, ts }) {
+async function scrapePage({ cc, page }) {
   const url = `${BASE_URL}&filter=topsellers&cc=${cc}&page=${page}`;
 
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
@@ -148,9 +145,7 @@ async function scrapePage({ cc, page, ts }) {
 
       $(".search_result_row").each((_, el) => {
         const appid = extractAppId($(el).attr("href"));
-        if (appid) {
-          rows.push({ appid });
-        }
+        if (appid) rows.push({ appid });
       });
 
       return rows;
@@ -170,10 +165,10 @@ async function scrapePage({ cc, page, ts }) {
 
 async function runRegion({ cc, ts }) {
   let rows = [];
-  let rank = 1; // 🔴 rank ТІЛЬКИ для history
+  let rank = 1; // rank ТІЛЬКИ для history
 
   for (let page = 1; page <= MAX_PAGES; page++) {
-    const pageRows = await scrapePage({ cc, page, ts });
+    const pageRows = await scrapePage({ cc, page });
     if (!pageRows.length) break;
 
     for (const r of pageRows) {
@@ -188,9 +183,6 @@ async function runRegion({ cc, ts }) {
     await sleep(PAGE_DELAY_MS);
   }
 
-  /**
-   * DEDUPE — перша поява appid
-   */
   const unique = [...new Map(rows.map((r) => [r.appid, r])).values()];
 
   if (unique.length < MIN_VALID_ITEMS_REGION) {
@@ -198,9 +190,6 @@ async function runRegion({ cc, ts }) {
     return null;
   }
 
-  /**
-   * CLEAN RANK ДЛЯ CURRENT
-   */
   const current = unique.map((r, i) => ({
     cc,
     appid: r.appid,
@@ -230,7 +219,6 @@ async function runSnapshot() {
   );
 
   let history = [];
-  let current = [];
   let pages = [];
 
   for (const cc of ccs) {
@@ -240,7 +228,14 @@ async function runSnapshot() {
     if (!res) continue;
 
     history.push(...res.history);
-    current.push(...res.current);
+
+    // 🔴 КЛЮЧОВИЙ ФІКС
+    await clearCurrentRegion(cc);
+    await insertChunked(
+      "steam_topsellers_current_region",
+      res.current
+    );
+
     pages.push({
       cc,
       total_pages: res.totalPages,
@@ -254,7 +249,7 @@ async function runSnapshot() {
   }
 
   /**
-   * HISTORY (RAW, З RANK)
+   * HISTORY
    */
   await insertChunked(
     "steam_topsellers_history_region",
@@ -267,21 +262,12 @@ async function runSnapshot() {
   );
 
   /**
-   * CURRENT (CLEAN)
-   */
-  await upsertChunked(
-    "steam_topsellers_current_region",
-    current,
-    "cc,appid"
-  );
-
-  /**
    * PAGES
    */
   await upsertPages(pages);
 
   log(
-    `===== SNAPSHOT DONE ts=${ts} | history=${history.length} | current=${current.length} =====`
+    `===== SNAPSHOT DONE ts=${ts} | history=${history.length} =====`
   );
 }
 
