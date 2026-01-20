@@ -149,11 +149,7 @@ async function scrapePage({ cc, page, ts }) {
       $(".search_result_row").each((_, el) => {
         const appid = extractAppId($(el).attr("href"));
         if (appid) {
-          rows.push({
-            appid,
-            cc,
-            ts,
-          });
+          rows.push({ appid });
         }
       });
 
@@ -174,17 +170,26 @@ async function scrapePage({ cc, page, ts }) {
 
 async function runRegion({ cc, ts }) {
   let rows = [];
+  let rank = 1; // 🔴 rank ТІЛЬКИ для history
 
   for (let page = 1; page <= MAX_PAGES; page++) {
     const pageRows = await scrapePage({ cc, page, ts });
     if (!pageRows.length) break;
 
-    rows.push(...pageRows);
+    for (const r of pageRows) {
+      rows.push({
+        appid: r.appid,
+        cc,
+        rank: rank++,
+        ts,
+      });
+    }
+
     await sleep(PAGE_DELAY_MS);
   }
 
   /**
-   * DEDUPE — залишаємо першу появу appid
+   * DEDUPE — перша поява appid
    */
   const unique = [...new Map(rows.map((r) => [r.appid, r])).values()];
 
@@ -194,7 +199,7 @@ async function runRegion({ cc, ts }) {
   }
 
   /**
-   * ASSIGN CLEAN RANK (ПОСЛІДОВНО)
+   * CLEAN RANK ДЛЯ CURRENT
    */
   const current = unique.map((r, i) => ({
     cc,
@@ -249,19 +254,20 @@ async function runSnapshot() {
   }
 
   /**
-   * HISTORY (RAW)
+   * HISTORY (RAW, З RANK)
    */
   await insertChunked(
     "steam_topsellers_history_region",
     history.map((r) => ({
       appid: r.appid,
       cc: r.cc,
+      rank: r.rank,
       ts: r.ts,
     }))
   );
 
   /**
-   * CURRENT (CLEAN RANK)
+   * CURRENT (CLEAN)
    */
   await upsertChunked(
     "steam_topsellers_current_region",
