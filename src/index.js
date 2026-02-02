@@ -68,7 +68,7 @@ function chunkArray(arr, size) {
 }
 
 /**
- * 🕒 визначаємо групу країн по UTC-хвилинах
+ * 🕒 GROUP BY UTC MINUTES
  */
 function getRegionGroup() {
   const m = new Date().getUTCMinutes();
@@ -102,9 +102,6 @@ async function upsertPages(rows) {
   if (error) throw error;
 }
 
-/**
- * 🔴 КРИТИЧНО: очищення current для одного регіону
- */
 async function clearCurrentRegion(cc) {
   const { error } = await supabase
     .from("steam_topsellers_current_region")
@@ -151,7 +148,7 @@ async function scrapePage({ cc, page }) {
 }
 
 /**
- * ================= REGION =================
+ * ================= REGION SCRAPE =================
  */
 
 async function runRegion({ cc, ts }) {
@@ -173,17 +170,15 @@ async function runRegion({ cc, ts }) {
 
   if (unique.length < MIN_VALID_ITEMS_REGION) return null;
 
-  const current = unique.map((r, i) => ({
-    cc,
-    appid: r.appid,
-    rank: i + 1,
-    updated_ts: ts,
-  }));
-
   return {
     history: rows,
-    current,
     unique,
+    current: unique.map((r, i) => ({
+      cc,
+      appid: r.appid,
+      rank: i + 1,
+      updated_ts: ts,
+    })),
     totalPages: Math.ceil(unique.length / FRONT_PAGE_SIZE),
   };
 }
@@ -216,7 +211,9 @@ async function runSnapshot() {
       updated_ts: ts,
     });
 
-    /* ================= NEW: REGION HOURLY ================= */
+    /**
+     * ================= HOURLY (FIXED) =================
+     */
 
     const hourly = res.unique.map((r, i) => ({
       cc,
@@ -227,7 +224,7 @@ async function runSnapshot() {
 
     for (let i = 0; i < hourly.length; i += 1000) {
       await supabase
-        .from("steam_app_topsellers_stats_region")
+        .from("steam_app_topsellers_hourly_region") // ✅ FIX
         .upsert(hourly.slice(i, i + 1000), {
           onConflict: "cc,appid,ts",
           ignoreDuplicates: true,
@@ -235,19 +232,21 @@ async function runSnapshot() {
     }
 
     await supabase
-      .from("steam_app_topsellers_stats_region")
+      .from("steam_app_topsellers_hourly_region") // ✅ FIX
       .delete()
       .eq("cc", cc)
       .lt("ts", ts - 48 * 3600);
 
-    /* ================= NEW: REGION STATS ================= */
+    /**
+     * ================= STATS =================
+     */
 
     const appids = hourly.map((r) => r.appid);
     const prevMap = new Map();
 
     for (let i = 0; i < appids.length; i += 1000) {
       const { data } = await supabase
-        .from("steam_app_topsellers_region_stats")
+        .from("steam_app_topsellers_stats_region")
         .select("*")
         .eq("cc", cc)
         .in("appid", appids.slice(i, i + 1000));
@@ -269,35 +268,14 @@ async function runSnapshot() {
       return {
         cc,
         appid: r.appid,
-
         rank_now: r.rank,
-
         best_24h_rank: r.rank,
         best_24h_rank_ts: ts,
-
         best_all_time_rank: bestAll,
         best_all_time_rank_ts: bestAllTs,
-
         updated_ts: ts,
       };
     });
-
-    for (let i = 0; i < stats.length; i += 500) {
-      const slice = stats.slice(i, i + 500);
-
-      const { data } = await supabase.rpc("get_region_app_24h_best_ranks", {
-        cc,
-        appids: slice.map((x) => x.appid),
-      });
-
-      for (const row of data || []) {
-        const u = slice.find((x) => x.appid === row.appid);
-        if (u && row.best_rank < u.best_rank_24h) {
-          u.best_rank_24h = row.best_rank;
-          u.best_rank_24h_ts = row.ts;
-        }
-      }
-    }
 
     for (let i = 0; i < stats.length; i += 1000) {
       await supabase
@@ -329,8 +307,8 @@ async function main() {
 
     try {
       await runSnapshot();
-    } catch (e) {
-      log(`❌ SNAPSHOT FAILED`);
+    } catch {
+      log("❌ SNAPSHOT FAILED");
     }
   }
 }
