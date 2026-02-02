@@ -227,7 +227,7 @@ async function runSnapshot() {
 
     for (let i = 0; i < hourly.length; i += 1000) {
       await supabase
-        .from("steam_app_topsellers_region_hourly")
+        .from("steam_app_topsellers_hourly_region")
         .upsert(hourly.slice(i, i + 1000), {
           onConflict: "cc,appid,ts",
           ignoreDuplicates: true,
@@ -235,7 +235,7 @@ async function runSnapshot() {
     }
 
     await supabase
-      .from("steam_app_topsellers_region_hourly")
+      .from("steam_app_topsellers_hourly_region")
       .delete()
       .eq("cc", cc)
       .lt("ts", ts - 48 * 3600);
@@ -258,8 +258,8 @@ async function runSnapshot() {
     const stats = hourly.map((r) => {
       const prev = prevMap.get(r.appid);
 
-      let bestAll = prev?.best_rank_all_time ?? r.rank;
-      let bestAllTs = prev?.best_rank_all_time_ts ?? ts;
+      let bestAll = prev?.best_all_time_rank ?? r.rank;
+      let bestAllTs = prev?.best_all_time_rank_ts ?? ts;
 
       if (r.rank < bestAll) {
         bestAll = r.rank;
@@ -269,11 +269,15 @@ async function runSnapshot() {
       return {
         cc,
         appid: r.appid,
-        rank_right_now: r.rank,
-        best_rank_24h: r.rank,
-        best_rank_24h_ts: ts,
-        best_rank_all_time: bestAll,
-        best_rank_all_time_ts: bestAllTs,
+
+        rank_now: r.rank,
+
+        best_24h_rank: r.rank,
+        best_24h_rank_ts: ts,
+
+        best_all_time_rank: bestAll,
+        best_all_time_rank_ts: bestAllTs,
+
         updated_ts: ts,
       };
     });
@@ -297,7 +301,7 @@ async function runSnapshot() {
 
     for (let i = 0; i < stats.length; i += 1000) {
       await supabase
-        .from("steam_app_topsellers_region_stats")
+        .from("steam_app_topsellers_hourly_region")
         .upsert(stats.slice(i, i + 1000), { onConflict: "cc,appid" });
     }
   }
