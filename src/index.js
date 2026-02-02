@@ -227,7 +227,7 @@ async function runSnapshot() {
 
     for (let i = 0; i < hourly.length; i += 1000) {
       await supabase
-        .from("steam_app_topsellers_hourly_region")
+        .from("steam_app_topsellers_stats_region")
         .upsert(hourly.slice(i, i + 1000), {
           onConflict: "cc,appid,ts",
           ignoreDuplicates: true,
@@ -235,7 +235,7 @@ async function runSnapshot() {
     }
 
     await supabase
-      .from("steam_app_topsellers_hourly_region")
+      .from("steam_app_topsellers_stats_region")
       .delete()
       .eq("cc", cc)
       .lt("ts", ts - 48 * 3600);
@@ -301,7 +301,7 @@ async function runSnapshot() {
 
     for (let i = 0; i < stats.length; i += 1000) {
       await supabase
-        .from("steam_app_topsellers_hourly_region")
+        .from("steam_app_topsellers_stats_region")
         .upsert(stats.slice(i, i + 1000), { onConflict: "cc,appid" });
     }
   }
