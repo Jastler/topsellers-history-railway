@@ -90,8 +90,6 @@ async function insertChunked(table, rows) {
     const { error } = await supabase.from(table).insert(chunk);
     if (error) throw error;
   }
-
-  log(`✔ INSERT ${table} done`);
 }
 
 async function upsertPages(rows) {
@@ -102,16 +100,12 @@ async function upsertPages(rows) {
     .upsert(rows, { onConflict: "cc" });
 
   if (error) throw error;
-
-  log(`✔ pages updated (${rows.length})`);
 }
 
 /**
  * 🔴 КРИТИЧНО: очищення current для одного регіону
  */
 async function clearCurrentRegion(cc) {
-  log(`🧹 Clearing current_region for cc=${cc}`);
-
   const { error } = await supabase
     .from("steam_topsellers_current_region")
     .delete()
@@ -138,7 +132,7 @@ async function scrapePage({ cc, page }) {
       });
 
       clearTimeout(timeout);
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      if (!res.ok) throw new Error();
 
       const $ = cheerio.load(await res.text());
       const rows = [];
@@ -150,10 +144,7 @@ async function scrapePage({ cc, page }) {
 
       return rows;
     } catch {
-      if (attempt === MAX_ATTEMPTS) {
-        log(`❌ ${cc} page ${page} failed`);
-        return [];
-      }
+      if (attempt === MAX_ATTEMPTS) return [];
       await sleep(3000);
     }
   }
@@ -165,19 +156,14 @@ async function scrapePage({ cc, page }) {
 
 async function runRegion({ cc, ts }) {
   let rows = [];
-  let rank = 1; // rank ТІЛЬКИ для history
+  let rank = 1;
 
   for (let page = 1; page <= MAX_PAGES; page++) {
     const pageRows = await scrapePage({ cc, page });
     if (!pageRows.length) break;
 
     for (const r of pageRows) {
-      rows.push({
-        appid: r.appid,
-        cc,
-        rank: rank++,
-        ts,
-      });
+      rows.push({ appid: r.appid, cc, rank: rank++, ts });
     }
 
     await sleep(PAGE_DELAY_MS);
@@ -185,10 +171,7 @@ async function runRegion({ cc, ts }) {
 
   const unique = [...new Map(rows.map((r) => [r.appid, r])).values()];
 
-  if (unique.length < MIN_VALID_ITEMS_REGION) {
-    log(`⚠️ ${cc}: too few items (${unique.length}), skipped`);
-    return null;
-  }
+  if (unique.length < MIN_VALID_ITEMS_REGION) return null;
 
   const current = unique.map((r, i) => ({
     cc,
@@ -200,6 +183,7 @@ async function runRegion({ cc, ts }) {
   return {
     history: rows,
     current,
+    unique,
     totalPages: Math.ceil(unique.length / FRONT_PAGE_SIZE),
   };
 }
@@ -212,63 +196,118 @@ async function runSnapshot() {
   const ts = Math.floor(Date.now() / 1000);
   const { idx, ccs } = getRegionGroup();
 
-  log(
-    `===== SNAPSHOT START ts=${ts} | group=${idx} | ccs=[${ccs.join(
-      ", "
-    )}] =====`
-  );
+  log(`===== SNAPSHOT START ts=${ts} | group=${idx} =====`);
 
   let history = [];
   let pages = [];
 
   for (const cc of ccs) {
-    log(`→ scraping ${cc}`);
-
     const res = await runRegion({ cc, ts });
     if (!res) continue;
 
     history.push(...res.history);
 
-    // 🔴 КЛЮЧОВИЙ ФІКС
     await clearCurrentRegion(cc);
-    await insertChunked(
-      "steam_topsellers_current_region",
-      res.current
-    );
+    await insertChunked("steam_topsellers_current_region", res.current);
 
     pages.push({
       cc,
       total_pages: res.totalPages,
       updated_ts: ts,
     });
-  }
 
-  if (!history.length) {
-    log("❌ No valid regions scraped, aborting snapshot");
-    return;
-  }
+    /* ================= NEW: REGION HOURLY ================= */
 
-  /**
-   * HISTORY
-   */
-  await insertChunked(
-    "steam_topsellers_history_region",
-    history.map((r) => ({
+    const hourly = res.unique.map((r, i) => ({
+      cc,
       appid: r.appid,
-      cc: r.cc,
-      rank: r.rank,
-      ts: r.ts,
-    }))
-  );
+      ts,
+      rank: i + 1,
+    }));
 
-  /**
-   * PAGES
-   */
-  await upsertPages(pages);
+    for (let i = 0; i < hourly.length; i += 1000) {
+      await supabase
+        .from("steam_app_topsellers_region_hourly")
+        .upsert(hourly.slice(i, i + 1000), {
+          onConflict: "cc,appid,ts",
+          ignoreDuplicates: true,
+        });
+    }
 
-  log(
-    `===== SNAPSHOT DONE ts=${ts} | history=${history.length} =====`
-  );
+    await supabase
+      .from("steam_app_topsellers_region_hourly")
+      .delete()
+      .eq("cc", cc)
+      .lt("ts", ts - 48 * 3600);
+
+    /* ================= NEW: REGION STATS ================= */
+
+    const appids = hourly.map((r) => r.appid);
+    const prevMap = new Map();
+
+    for (let i = 0; i < appids.length; i += 1000) {
+      const { data } = await supabase
+        .from("steam_app_topsellers_region_stats")
+        .select("*")
+        .eq("cc", cc)
+        .in("appid", appids.slice(i, i + 1000));
+
+      for (const r of data || []) prevMap.set(r.appid, r);
+    }
+
+    const stats = hourly.map((r) => {
+      const prev = prevMap.get(r.appid);
+
+      let bestAll = prev?.best_rank_all_time ?? r.rank;
+      let bestAllTs = prev?.best_rank_all_time_ts ?? ts;
+
+      if (r.rank < bestAll) {
+        bestAll = r.rank;
+        bestAllTs = ts;
+      }
+
+      return {
+        cc,
+        appid: r.appid,
+        rank_right_now: r.rank,
+        best_rank_24h: r.rank,
+        best_rank_24h_ts: ts,
+        best_rank_all_time: bestAll,
+        best_rank_all_time_ts: bestAllTs,
+        updated_ts: ts,
+      };
+    });
+
+    for (let i = 0; i < stats.length; i += 500) {
+      const slice = stats.slice(i, i + 500);
+
+      const { data } = await supabase.rpc("get_region_app_24h_best_ranks", {
+        cc,
+        appids: slice.map((x) => x.appid),
+      });
+
+      for (const row of data || []) {
+        const u = slice.find((x) => x.appid === row.appid);
+        if (u && row.best_rank < u.best_rank_24h) {
+          u.best_rank_24h = row.best_rank;
+          u.best_rank_24h_ts = row.ts;
+        }
+      }
+    }
+
+    for (let i = 0; i < stats.length; i += 1000) {
+      await supabase
+        .from("steam_app_topsellers_region_stats")
+        .upsert(stats.slice(i, i + 1000), { onConflict: "cc,appid" });
+    }
+  }
+
+  if (history.length) {
+    await insertChunked("steam_topsellers_history_region", history);
+    await upsertPages(pages);
+  }
+
+  log(`===== SNAPSHOT DONE ts=${ts} =====`);
 }
 
 /**
@@ -282,14 +321,12 @@ async function main() {
     next.setUTCMinutes(Math.ceil(now.getUTCMinutes() / 10) * 10);
     next.setUTCSeconds(0);
 
-    const wait = next - now;
-    log(`Waiting ${Math.round(wait / 1000)}s`);
-    await sleep(wait);
+    await sleep(next - now);
 
     try {
       await runSnapshot();
     } catch (e) {
-      log(`❌ SNAPSHOT FAILED: ${e.message}`);
+      log(`❌ SNAPSHOT FAILED`);
     }
   }
 }
