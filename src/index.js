@@ -1,7 +1,13 @@
-import fetch from "node-fetch";
+import fetchOrig from "node-fetch";
+import fetchCookie from "fetch-cookie";
+import { CookieJar } from "tough-cookie";
 import * as cheerio from "cheerio";
 import { createClient } from "@supabase/supabase-js";
 import "dotenv/config";
+
+/* ================= COOKIE FETCH (для adult / age-check) ================= */
+const jar = new CookieJar();
+const fetch = fetchCookie(fetchOrig, jar);
 
 /**
  * ================= CONFIG =================
@@ -43,6 +49,32 @@ const supabase = createClient(
     auth: { persistSession: false },
   }
 );
+
+/**
+ * ================= COOKIES (age-check → показує adult ігри) =================
+ */
+async function injectCookies() {
+  const cookies = [
+    `birthtime=1; Domain=store.steampowered.com; Path=/`,
+    `lastagecheckage=1-January-1970; Domain=store.steampowered.com; Path=/`,
+    `wants_mature_content=1; Domain=store.steampowered.com; Path=/`,
+  ];
+  if (process.env.STEAM_COOKIES) {
+    try {
+      const arr = JSON.parse(process.env.STEAM_COOKIES);
+      for (const c of arr) {
+        if (c.name && c.value != null)
+          cookies.push(
+            `${c.name}=${c.value}; Domain=${c.domain || "store.steampowered.com"}; Path=${c.path || "/"}`
+          );
+      }
+    } catch (_) {}
+  }
+  for (const c of cookies) {
+    await jar.setCookie(c, "https://store.steampowered.com");
+  }
+  log("Cookies injected (age-check + optional STEAM_COOKIES)");
+}
 
 /**
  * ================= HELPERS =================
@@ -297,6 +329,8 @@ async function runSnapshot() {
  */
 
 async function main() {
+  await injectCookies();
+
   while (true) {
     const now = new Date();
     const next = new Date(now);
