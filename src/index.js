@@ -51,29 +51,42 @@ const supabase = createClient(
 );
 
 /**
- * ================= COOKIES (age-check → показує adult ігри) =================
+ * ================= COOKIES (повний набір для adult) =================
  */
+const STEAM_COOKIES = [
+  { domain: "store.steampowered.com", name: "timezoneOffset", path: "/", secure: false, httpOnly: false, sameSite: "unspecified", value: "7200,0" },
+  { domain: "store.steampowered.com", name: "bGameHighlightAudioEnabled", path: "/", secure: false, httpOnly: false, sameSite: "unspecified", value: "true" },
+  { domain: "store.steampowered.com", name: "Steam_Language", path: "/", secure: true, httpOnly: false, sameSite: "no_restriction", value: "english" },
+  { domain: "store.steampowered.com", name: "timezoneName", path: "/", secure: true, httpOnly: false, sameSite: "no_restriction", value: "Europe/Kiev" },
+  { domain: "store.steampowered.com", name: "browserid", path: "/", secure: true, httpOnly: false, sameSite: "no_restriction", value: "409394601280791133" },
+  { domain: "store.steampowered.com", name: "lastagecheckage", path: "/", secure: true, httpOnly: false, sameSite: "lax", value: "1-January-1970" },
+  { domain: "store.steampowered.com", name: "birthtime", path: "/", secure: true, httpOnly: false, sameSite: "lax", value: "1" },
+  { domain: "store.steampowered.com", name: "flGameHighlightPlayerVolume", path: "/", secure: false, httpOnly: false, sameSite: "unspecified", value: "10" },
+  { domain: "store.steampowered.com", name: "steamLoginSecure", path: "/", secure: true, httpOnly: true, sameSite: "no_restriction", value: "76561198052716339%7C%7CeyAidHlwIjogIkpXVCIsICJhbGciOiAiRWREU0EiIH0.eyAiaXNzIjogInI6MDAwRV8yN0FDMjdCMl83Mjg0OCIsICJzdWIiOiAiNzY1NjExOTgwNTI3MTYzMzkiLCAiYXVkIjogWyAid2ViOnN0b3JlIiBdLCAiZXhwIjogMTc3MDk5MTIyNCwgIm5iZiI6IDE3NjIyNjQzMzcsICJpYXQiOiAxNzcwOTA0MzM3LCAianRpIjogIjAwMENfMjdCNkREQ0RfQTM5QzIiLCAib2F0IjogMTc3MDYzNDA1MiwgInJ0X2V4cCI6IDE3ODg5MDM1MzQsICJwZXIiOiAwLCAiaXBfc3ViamVjdCI6ICI3OS4xMTAuMTI5LjY5IiwgImlwX2NvbmZpcm1lciI6ICI3OS4xMTAuMTI5LjY5IiB9.HcW_tvaUsgjW-n9N1zd4xcKOnOokCoEFWioIDY8H1yBv3yfZ12WiGSw3OfIEKH-3_cxJcP0EmRksCJdTU1JCBQ" },
+  { domain: "store.steampowered.com", name: "sessionid", path: "/", secure: true, httpOnly: false, sameSite: "no_restriction", value: "fe6dec188564bf91f833f57d" },
+  { domain: "store.steampowered.com", name: "steamCountry", path: "/", secure: true, httpOnly: true, sameSite: "no_restriction", value: "UA%7Cdcc52d0e2cd49e8d2b7a84ba6b93b099" },
+  { domain: "store.steampowered.com", name: "recentapps", path: "/", secure: true, httpOnly: false, sameSite: "no_restriction", value: "%7B%221997410%22%3A1770916863%2C%223101040%22%3A1770916792%2C%221290000%22%3A1770916788%2C%22552990%22%3A1770916473%2C%222357570%22%3A1770904338%2C%222358720%22%3A1770740184%2C%22686060%22%3A1770740031%2C%22652150%22%3A1770718138%2C%222432860%22%3A1770717774%2C%22730%22%3A1770635331%7D" },
+];
+
+function toCookieString(c) {
+  const domain = c.domain || "store.steampowered.com";
+  const path = c.path || "/";
+  let s = `${c.name}=${c.value}; Domain=${domain}; Path=${path}`;
+  if (c.secure) s += "; Secure";
+  if (c.httpOnly) s += "; HttpOnly";
+  if (c.sameSite && c.sameSite !== "unspecified") s += `; SameSite=${c.sameSite}`;
+  return s;
+}
+
 async function injectCookies() {
-  const cookies = [
-    `birthtime=1; Domain=store.steampowered.com; Path=/`,
-    `lastagecheckage=1-January-1970; Domain=store.steampowered.com; Path=/`,
-    `wants_mature_content=1; Domain=store.steampowered.com; Path=/`,
-  ];
-  if (process.env.STEAM_COOKIES) {
-    try {
-      const arr = JSON.parse(process.env.STEAM_COOKIES);
-      for (const c of arr) {
-        if (c.name && c.value != null)
-          cookies.push(
-            `${c.name}=${c.value}; Domain=${c.domain || "store.steampowered.com"}; Path=${c.path || "/"}`
-          );
-      }
-    } catch (_) {}
+  const storeUrl = "https://store.steampowered.com";
+  const names = [];
+  for (const c of STEAM_COOKIES) {
+    const str = toCookieString(c);
+    await jar.setCookie(str, storeUrl);
+    names.push(c.name);
   }
-  for (const c of cookies) {
-    await jar.setCookie(c, "https://store.steampowered.com");
-  }
-  log("Cookies injected (age-check + optional STEAM_COOKIES)");
+  log(`Cookies injected: ${names.length} (${names.join(", ")})`);
 }
 
 /**
