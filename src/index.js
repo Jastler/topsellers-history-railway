@@ -3,6 +3,8 @@ import fetchCookie from "fetch-cookie";
 import { CookieJar } from "tough-cookie";
 import * as cheerio from "cheerio";
 import { createClient } from "@supabase/supabase-js";
+import { LoginSession, EAuthSessionGuardType, EAuthTokenPlatformType } from "steam-session";
+import { generateAuthCode } from "steam-totp";
 import "dotenv/config";
 
 /* ================= COOKIE FETCH (для adult / age-check) ================= */
@@ -53,7 +55,20 @@ const supabase = createClient(
 /**
  * ================= COOKIES (повний набір для adult) =================
  */
-const STEAM_COOKIES = [
+const STEAM_LOGIN_SECURE_FALLBACK =
+  "76561198052716339%7C%7CeyAidHlwIjogIkpXVCIsICJhbGciOiAiRWREU0EiIH0.eyAiaXNzIjogInI6MDAwRV8yN0FDMjdCMl83Mjg0OCIsICJzdWIiOiAiNzY1NjExOTgwNTI3MTYzMzkiLCAiYXVkIjogWyAid2ViOnN0b3JlIiBdLCAiZXhwIjogMTc3MDk5MTIyNCwgIm5iZiI6IDE3NjIyNjQzMzcsICJpYXQiOiAxNzcwOTA0MzM3LCAianRpIjogIjAwMENfMjdCNkREQ0RfQTM5QzIiLCAib2F0IjogMTc3MDYzNDA1MiwgInJ0X2V4cCI6IDE3ODg5MDM1MzQsICJwZXIiOiAwLCAiaXBfc3ViamVjdCI6ICI3OS4xMTAuMTI5LjY5IiwgImlwX2NvbmZpcm1lciI6ICI3OS4xMTAuMTI5LjY5IiB9.HcW_tvaUsgjW-n9N1zd4xcKOnOokCoEFWioIDY8H1yBv3yfZ12WiGSw3OfIEKH-3_cxJcP0EmRksCJdTU1JCBQ";
+
+let currentSteamLoginSecure = STEAM_LOGIN_SECURE_FALLBACK;
+let lastRefreshToken = null;
+
+// TODO: перенести в env vars (Railway Variables)
+const STEAM_CREDENTIALS = {
+  username: process.env.STEAM_USERNAME || "jastle87",
+  password: process.env.STEAM_PASSWORD || "Nfhfcxbhrjd1",
+  sharedSecret: process.env.STEAM_SHARED_SECRET || "WUnt7AtHEoU542Q6gd3GarI6Zho=",
+};
+
+const STEAM_COOKIES_BASE = [
   { domain: "store.steampowered.com", name: "timezoneOffset", path: "/", secure: false, httpOnly: false, sameSite: "unspecified", value: "7200,0" },
   { domain: "store.steampowered.com", name: "bGameHighlightAudioEnabled", path: "/", secure: false, httpOnly: false, sameSite: "unspecified", value: "true" },
   { domain: "store.steampowered.com", name: "Steam_Language", path: "/", secure: true, httpOnly: false, sameSite: "no_restriction", value: "english" },
@@ -62,11 +77,17 @@ const STEAM_COOKIES = [
   { domain: "store.steampowered.com", name: "lastagecheckage", path: "/", secure: true, httpOnly: false, sameSite: "lax", value: "1-January-1970" },
   { domain: "store.steampowered.com", name: "birthtime", path: "/", secure: true, httpOnly: false, sameSite: "lax", value: "1" },
   { domain: "store.steampowered.com", name: "flGameHighlightPlayerVolume", path: "/", secure: false, httpOnly: false, sameSite: "unspecified", value: "10" },
-  { domain: "store.steampowered.com", name: "steamLoginSecure", path: "/", secure: true, httpOnly: true, sameSite: "no_restriction", value: "76561198052716339%7C%7CeyAidHlwIjogIkpXVCIsICJhbGciOiAiRWREU0EiIH0.eyAiaXNzIjogInI6MDAwRV8yN0FDMjdCMl83Mjg0OCIsICJzdWIiOiAiNzY1NjExOTgwNTI3MTYzMzkiLCAiYXVkIjogWyAid2ViOnN0b3JlIiBdLCAiZXhwIjogMTc3MDk5MTIyNCwgIm5iZiI6IDE3NjIyNjQzMzcsICJpYXQiOiAxNzcwOTA0MzM3LCAianRpIjogIjAwMENfMjdCNkREQ0RfQTM5QzIiLCAib2F0IjogMTc3MDYzNDA1MiwgInJ0X2V4cCI6IDE3ODg5MDM1MzQsICJwZXIiOiAwLCAiaXBfc3ViamVjdCI6ICI3OS4xMTAuMTI5LjY5IiwgImlwX2NvbmZpcm1lciI6ICI3OS4xMTAuMTI5LjY5IiB9.HcW_tvaUsgjW-n9N1zd4xcKOnOokCoEFWioIDY8H1yBv3yfZ12WiGSw3OfIEKH-3_cxJcP0EmRksCJdTU1JCBQ" },
+  { domain: "store.steampowered.com", name: "steamLoginSecure", path: "/", secure: true, httpOnly: true, sameSite: "no_restriction", value: null },
   { domain: "store.steampowered.com", name: "sessionid", path: "/", secure: true, httpOnly: false, sameSite: "no_restriction", value: "fe6dec188564bf91f833f57d" },
   { domain: "store.steampowered.com", name: "steamCountry", path: "/", secure: true, httpOnly: true, sameSite: "no_restriction", value: "UA%7Cdcc52d0e2cd49e8d2b7a84ba6b93b099" },
   { domain: "store.steampowered.com", name: "recentapps", path: "/", secure: true, httpOnly: false, sameSite: "no_restriction", value: "%7B%221997410%22%3A1770916863%2C%223101040%22%3A1770916792%2C%221290000%22%3A1770916788%2C%22552990%22%3A1770916473%2C%222357570%22%3A1770904338%2C%222358720%22%3A1770740184%2C%22686060%22%3A1770740031%2C%22652150%22%3A1770718138%2C%222432860%22%3A1770717774%2C%22730%22%3A1770635331%7D" },
 ];
+
+function getSteamCookies() {
+  return STEAM_COOKIES_BASE.map((c) =>
+    c.name === "steamLoginSecure" ? { ...c, value: currentSteamLoginSecure } : c
+  );
+}
 
 function toCookieString(c) {
   const domain = c.domain || "store.steampowered.com";
@@ -80,8 +101,9 @@ function toCookieString(c) {
 
 async function injectCookies() {
   const storeUrl = "https://store.steampowered.com";
+  const cookies = getSteamCookies();
   const names = [];
-  for (const c of STEAM_COOKIES) {
+  for (const c of cookies) {
     const str = toCookieString(c);
     await jar.setCookie(str, storeUrl);
     names.push(c.name);
@@ -110,6 +132,87 @@ function chunkArray(arr, size) {
     out.push(arr.slice(i, i + size));
   }
   return out;
+}
+
+/**
+ * ================= STEAM SESSION REFRESH (кожні 12 год) =================
+ */
+const STEAM_REFRESH_INTERVAL_MS = 12 * 60 * 60 * 1000;
+
+function parseSteamLoginSecureFromCookies(cookieStrings) {
+  for (const s of cookieStrings) {
+    const m = s.match(/^steamLoginSecure=([^;]+)/);
+    if (m) return m[1].trim();
+  }
+  return null;
+}
+
+async function refreshSteamSession() {
+  const { username: accountName, password, sharedSecret } = STEAM_CREDENTIALS;
+
+  if (!accountName || !password || !sharedSecret || password === "ADD_YOUR_PASSWORD_HERE") {
+    log("Steam auto-refresh skipped: STEAM_USERNAME, STEAM_PASSWORD, STEAM_SHARED_SECRET not set");
+    return false;
+  }
+
+  const session = new LoginSession(EAuthTokenPlatformType.MobileApp);
+
+  const authPromise = new Promise((resolve, reject) => {
+    session.on("authenticated", resolve);
+    session.on("timeout", () => reject(new Error("Steam login timed out")));
+    session.on("error", reject);
+  });
+
+  try {
+    if (lastRefreshToken) {
+      try {
+        session.refreshToken = lastRefreshToken;
+        const cookies = await session.getWebCookies();
+        const secure = parseSteamLoginSecureFromCookies(cookies);
+        if (secure) {
+          currentSteamLoginSecure = secure;
+          log("Steam session refreshed via refresh token");
+          return true;
+        }
+      } catch (e) {
+        log(`Steam refresh token failed: ${e?.message || e}`);
+        lastRefreshToken = null;
+      }
+    }
+
+    const steamGuardCode = generateAuthCode(sharedSecret);
+    const startResult = await session.startWithCredentials({
+      accountName,
+      password,
+      steamGuardCode,
+    });
+
+    if (startResult.actionRequired && startResult.validActions?.some((a) => a.type === EAuthSessionGuardType.DeviceCode)) {
+      try {
+        const code = generateAuthCode(sharedSecret);
+        await session.submitSteamGuardCode(code);
+      } catch (e) {
+        log(`Steam Guard submit failed: ${e?.message || e}`);
+        return false;
+      }
+    } else if (startResult.actionRequired) {
+      log("Steam login requires action we cannot handle automatically");
+      return false;
+    }
+
+    await authPromise;
+    lastRefreshToken = session.refreshToken;
+    const cookies = await session.getWebCookies();
+    const secure = parseSteamLoginSecureFromCookies(cookies);
+    if (secure) {
+      currentSteamLoginSecure = secure;
+      log("Steam session refreshed via full login");
+      return true;
+    }
+  } catch (e) {
+    log(`Steam session refresh failed: ${e?.message || e}`);
+  }
+  return false;
 }
 
 /**
@@ -342,7 +445,18 @@ async function runSnapshot() {
  */
 
 async function main() {
+  await refreshSteamSession();
   await injectCookies();
+
+  setInterval(async () => {
+    try {
+      if (await refreshSteamSession()) {
+        await injectCookies();
+      }
+    } catch (e) {
+      log(`Steam session refresh interval error: ${e?.message || e}`);
+    }
+  }, STEAM_REFRESH_INTERVAL_MS);
 
   while (true) {
     const now = new Date();

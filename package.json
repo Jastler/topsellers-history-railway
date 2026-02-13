@@ -22,6 +22,8 @@
     "express": "^5.2.1",
     "fetch-cookie": "^3.2.0",
     "node-fetch": "^3.3.2",
+    "steam-session": "^1.9.4",
+    "steam-totp": "^2.1.2",
     "tough-cookie": "^6.0.0"
   },
   "devDependencies": {
