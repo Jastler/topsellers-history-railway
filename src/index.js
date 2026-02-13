@@ -136,8 +136,10 @@ function chunkArray(arr, size) {
 
 /**
  * ================= STEAM SESSION REFRESH (кожні 12 год) =================
+ * Зсув 6 год відносно topsellers-railway, щоб не конфліктувати при одночасному логіні
  */
 const STEAM_REFRESH_INTERVAL_MS = 12 * 60 * 60 * 1000;
+const STEAM_REFRESH_OFFSET_MS = 6 * 60 * 60 * 1000;
 
 function parseSteamLoginSecureFromCookies(cookieStrings) {
   for (const s of cookieStrings) {
@@ -448,15 +450,19 @@ async function main() {
   await refreshSteamSession();
   await injectCookies();
 
-  setInterval(async () => {
-    try {
-      if (await refreshSteamSession()) {
-        await injectCookies();
+  setTimeout(() => {
+    const runRefresh = async () => {
+      try {
+        if (await refreshSteamSession()) {
+          await injectCookies();
+        }
+      } catch (e) {
+        log(`Steam session refresh interval error: ${e?.message || e}`);
       }
-    } catch (e) {
-      log(`Steam session refresh interval error: ${e?.message || e}`);
-    }
-  }, STEAM_REFRESH_INTERVAL_MS);
+    };
+    runRefresh();
+    setInterval(runRefresh, STEAM_REFRESH_INTERVAL_MS);
+  }, STEAM_REFRESH_OFFSET_MS);
 
   while (true) {
     const now = new Date();
