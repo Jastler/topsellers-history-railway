@@ -1,7 +1,7 @@
 {
   "name": "topsellers-history-railway",
   "version": "1.0.0",
-  "description": "Worker для історичних даних top sellers",
+  "description": "Worker для історичних даних top sellers (IStoreQueryService/Query)",
   "type": "module",
   "main": "src/index.js",
   "scripts": {
@@ -9,22 +9,12 @@
     "dev": "nodemon src/index.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
-  "keywords": [
-    "railway",
-    "nodejs",
-    "supabase"
-  ],
+  "keywords": ["railway", "nodejs", "supabase"],
   "license": "ISC",
   "dependencies": {
     "@supabase/supabase-js": "^2.39.0",
-    "cheerio": "^1.1.2",
     "dotenv": "^17.2.3",
-    "express": "^5.2.1",
-    "fetch-cookie": "^3.2.0",
-    "node-fetch": "^3.3.2",
-    "steam-session": "^1.9.4",
-    "steam-totp": "^2.1.2",
-    "tough-cookie": "^6.0.0"
+    "node-fetch": "^3.3.2"
   },
   "devDependencies": {
     "nodemon": "^3.0.1"

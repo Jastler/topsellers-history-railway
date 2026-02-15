@@ -1,35 +1,23 @@
-import fetchOrig from "node-fetch";
-import fetchCookie from "fetch-cookie";
-import { CookieJar } from "tough-cookie";
-import * as cheerio from "cheerio";
+import fetch from "node-fetch";
 import { createClient } from "@supabase/supabase-js";
-import {
-  LoginSession,
-  EAuthSessionGuardType,
-  EAuthTokenPlatformType,
-} from "steam-session";
-import { generateAuthCode } from "steam-totp";
 import "dotenv/config";
-
-/* ================= COOKIE FETCH (для adult / age-check) ================= */
-const jar = new CookieJar();
-const fetch = fetchCookie(fetchOrig, jar);
 
 /**
  * ================= CONFIG =================
+ * Top sellers по регіонах через IStoreQueryService/Query.
+ * Коли й які країни — REGION_GROUPS (ротація кожні 10 хв).
+ * Запис у БД — як раніше (history, current, pages, hourly, stats).
  */
 
-const BASE_URL =
-  "https://store.steampowered.com/search/results/?query&count=100&ignore_preferences=1";
+const STEAM_KEY = process.env.STEAM_KEY;
+const API_BASE = "https://api.steampowered.com/IStoreQueryService/Query/v1/";
 
-const MAX_PAGES = 100;
-const FRONT_PAGE_SIZE = 10;
-const PAGE_DELAY_MS = 30;
+const BATCH_SIZE = 1000;
+const TOTAL_PER_REGION = 10000;
+const DELAY_BETWEEN_PAGES_MS = 400;
+const DELAY_BETWEEN_REGIONS_MS = 600;
 
-const TIMEOUT_MS = 40000;
-const MAX_ATTEMPTS = 6;
 const CHUNK_SIZE = 500;
-
 const MIN_VALID_ITEMS_REGION = 500;
 
 /**
@@ -43,10 +31,6 @@ const REGION_GROUPS = [
   ["at", "be", "cz", "hk", "sg"],
 ];
 
-/**
- * ================= SUPABASE =================
- */
-
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE,
@@ -56,142 +40,10 @@ const supabase = createClient(
   },
 );
 
-/**
- * ================= COOKIES (повний набір для adult) =================
- */
-const STEAM_LOGIN_SECURE_FALLBACK =
-  "76561198052716339%7C%7CeyAidHlwIjogIkpXVCIsICJhbGciOiAiRWREU0EiIH0.eyAiaXNzIjogInI6MDAwRV8yN0FDMjdCMl83Mjg0OCIsICJzdWIiOiAiNzY1NjExOTgwNTI3MTYzMzkiLCAiYXVkIjogWyAid2ViOnN0b3JlIiBdLCAiZXhwIjogMTc3MDk5MTIyNCwgIm5iZiI6IDE3NjIyNjQzMzcsICJpYXQiOiAxNzcwOTA0MzM3LCAianRpIjogIjAwMENfMjdCNkREQ0RfQTM5QzIiLCAib2F0IjogMTc3MDYzNDA1MiwgInJ0X2V4cCI6IDE3ODg5MDM1MzQsICJwZXIiOiAwLCAiaXBfc3ViamVjdCI6ICI3OS4xMTAuMTI5LjY5IiwgImlwX2NvbmZpcm1lciI6ICI3OS4xMTAuMTI5LjY5IiB9.HcW_tvaUsgjW-n9N1zd4xcKOnOokCoEFWioIDY8H1yBv3yfZ12WiGSw3OfIEKH-3_cxJcP0EmRksCJdTU1JCBQ";
-
-let currentSteamLoginSecure = STEAM_LOGIN_SECURE_FALLBACK;
-let lastRefreshToken = null;
-
-// TODO: перенести в env vars (Railway Variables)
-const STEAM_CREDENTIALS = {
-  username: process.env.STEAM_USERNAME || "jastle87",
-  password: process.env.STEAM_PASSWORD || "Nfhfcxbhrjd1",
-  sharedSecret:
-    process.env.STEAM_SHARED_SECRET || "WUnt7AtHEoU542Q6gd3GarI6Zho=",
-};
-
-const STEAM_COOKIES_BASE = [
-  {
-    domain: "store.steampowered.com",
-    name: "bGameHighlightAudioEnabled",
-    path: "/",
-    secure: false,
-    httpOnly: false,
-    sameSite: "unspecified",
-    value: "true",
-  },
-  {
-    domain: "store.steampowered.com",
-    name: "Steam_Language",
-    path: "/",
-    secure: true,
-    httpOnly: false,
-    sameSite: "no_restriction",
-    value: "english",
-  },
-  {
-    domain: "store.steampowered.com",
-    name: "browserid",
-    path: "/",
-    secure: true,
-    httpOnly: false,
-    sameSite: "no_restriction",
-    value: "409394601280791133",
-  },
-  {
-    domain: "store.steampowered.com",
-    name: "lastagecheckage",
-    path: "/",
-    secure: true,
-    httpOnly: false,
-    sameSite: "lax",
-    value: "1-January-1970",
-  },
-  {
-    domain: "store.steampowered.com",
-    name: "birthtime",
-    path: "/",
-    secure: true,
-    httpOnly: false,
-    sameSite: "lax",
-    value: "1",
-  },
-  {
-    domain: "store.steampowered.com",
-    name: "flGameHighlightPlayerVolume",
-    path: "/",
-    secure: false,
-    httpOnly: false,
-    sameSite: "unspecified",
-    value: "10",
-  },
-  {
-    domain: "store.steampowered.com",
-    name: "steamLoginSecure",
-    path: "/",
-    secure: true,
-    httpOnly: true,
-    sameSite: "no_restriction",
-    value: null,
-  },
-  {
-    domain: "store.steampowered.com",
-    name: "sessionid",
-    path: "/",
-    secure: true,
-    httpOnly: false,
-    sameSite: "no_restriction",
-    value: "fe6dec188564bf91f833f57d",
-  },
-];
-
-function getSteamCookies() {
-  return STEAM_COOKIES_BASE.map((c) =>
-    c.name === "steamLoginSecure"
-      ? { ...c, value: currentSteamLoginSecure }
-      : c,
-  );
-}
-
-function toCookieString(c) {
-  const domain = c.domain || "store.steampowered.com";
-  const path = c.path || "/";
-  let s = `${c.name}=${c.value}; Domain=${domain}; Path=${path}`;
-  if (c.secure) s += "; Secure";
-  if (c.httpOnly) s += "; HttpOnly";
-  if (c.sameSite && c.sameSite !== "unspecified")
-    s += `; SameSite=${c.sameSite}`;
-  return s;
-}
-
-async function injectCookies() {
-  const storeUrl = "https://store.steampowered.com";
-  const cookies = getSteamCookies();
-  const names = [];
-  for (const c of cookies) {
-    const str = toCookieString(c);
-    await jar.setCookie(str, storeUrl);
-    names.push(c.name);
-  }
-  log(`Cookies injected: ${names.length} (${names.join(", ")})`);
-}
-
-/**
- * ================= HELPERS =================
- */
-
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function log(msg) {
   console.log(`[${new Date().toISOString()}] ${msg}`);
-}
-
-function extractAppId(url) {
-  const m = url?.match(/\/app\/(\d+)/);
-  return m ? Number(m[1]) : null;
 }
 
 function chunkArray(arr, size) {
@@ -203,102 +55,7 @@ function chunkArray(arr, size) {
 }
 
 /**
- * ================= STEAM SESSION REFRESH (кожні 12 год) =================
- * Зсув 6 год відносно topsellers-railway, щоб не конфліктувати при одночасному логіні
- */
-const STEAM_REFRESH_INTERVAL_MS = 12 * 60 * 60 * 1000;
-const STEAM_REFRESH_OFFSET_MS = 6 * 60 * 60 * 1000;
-
-function parseSteamLoginSecureFromCookies(cookieStrings) {
-  for (const s of cookieStrings) {
-    const m = s.match(/^steamLoginSecure=([^;]+)/);
-    if (m) return m[1].trim();
-  }
-  return null;
-}
-
-async function refreshSteamSession() {
-  const { username: accountName, password, sharedSecret } = STEAM_CREDENTIALS;
-
-  if (
-    !accountName ||
-    !password ||
-    !sharedSecret ||
-    password === "ADD_YOUR_PASSWORD_HERE"
-  ) {
-    log(
-      "Steam auto-refresh skipped: STEAM_USERNAME, STEAM_PASSWORD, STEAM_SHARED_SECRET not set",
-    );
-    return false;
-  }
-
-  const session = new LoginSession(EAuthTokenPlatformType.MobileApp);
-
-  const authPromise = new Promise((resolve, reject) => {
-    session.on("authenticated", resolve);
-    session.on("timeout", () => reject(new Error("Steam login timed out")));
-    session.on("error", reject);
-  });
-
-  try {
-    if (lastRefreshToken) {
-      try {
-        session.refreshToken = lastRefreshToken;
-        const cookies = await session.getWebCookies();
-        const secure = parseSteamLoginSecureFromCookies(cookies);
-        if (secure) {
-          currentSteamLoginSecure = secure;
-          log("Steam session refreshed via refresh token");
-          return true;
-        }
-      } catch (e) {
-        log(`Steam refresh token failed: ${e?.message || e}`);
-        lastRefreshToken = null;
-      }
-    }
-
-    const steamGuardCode = generateAuthCode(sharedSecret);
-    const startResult = await session.startWithCredentials({
-      accountName,
-      password,
-      steamGuardCode,
-    });
-
-    if (
-      startResult.actionRequired &&
-      startResult.validActions?.some(
-        (a) => a.type === EAuthSessionGuardType.DeviceCode,
-      )
-    ) {
-      try {
-        const code = generateAuthCode(sharedSecret);
-        await session.submitSteamGuardCode(code);
-      } catch (e) {
-        log(`Steam Guard submit failed: ${e?.message || e}`);
-        return false;
-      }
-    } else if (startResult.actionRequired) {
-      log("Steam login requires action we cannot handle automatically");
-      return false;
-    }
-
-    await authPromise;
-    lastRefreshToken = session.refreshToken;
-    const cookies = await session.getWebCookies();
-    const secure = parseSteamLoginSecureFromCookies(cookies);
-    if (secure) {
-      currentSteamLoginSecure = secure;
-      log("Steam session refreshed via full login");
-      return true;
-    }
-  } catch (e) {
-    log(`Steam session refresh failed: ${e?.message || e}`);
-  }
-  return false;
-}
-
-/**
- * 🕒 GROUP BY UTC MINUTES
+ * 🕒 GROUP BY UTC MINUTES — яка група країн зараз
  */
 function getRegionGroup() {
   const m = new Date().getUTCMinutes();
@@ -307,15 +64,64 @@ function getRegionGroup() {
 }
 
 /**
+ * Один запит до Query API (одна сторінка пагінації)
+ */
+function buildInput(cc, start) {
+  return {
+    query: {
+      start,
+      count: BATCH_SIZE,
+      sort: 11,
+      filters: { global_top_n_sellers: TOTAL_PER_REGION },
+    },
+    context: { language: "en", country_code: cc.toUpperCase() },
+    data_request: { include_basic_info: true },
+  };
+}
+
+async function fetchStoreQueryPage(input) {
+  const url =
+    API_BASE +
+    "?key=" +
+    encodeURIComponent(STEAM_KEY) +
+    "&input_json=" +
+    encodeURIComponent(JSON.stringify(input));
+
+  const res = await fetch(url, {
+    method: "GET",
+    headers: { Accept: "application/json" },
+  });
+  const text = await res.text();
+  if (!res.ok) throw new Error(`HTTP ${res.status}: ${text.slice(0, 200)}`);
+  return JSON.parse(text);
+}
+
+/**
+ * Завантажити топ по регіону через Query API (з пагінацією)
+ */
+async function fetchRegionViaQuery(cc) {
+  const rows = [];
+  for (let start = 0; start < TOTAL_PER_REGION; start += BATCH_SIZE) {
+    const input = buildInput(cc, start);
+    const data = await fetchStoreQueryPage(input);
+    const items = data?.response?.store_items ?? [];
+    for (let i = 0; i < items.length; i++) {
+      const appid = items[i].appid ?? items[i].id;
+      if (appid) rows.push({ appid, rank: start + i + 1 });
+    }
+    if (items.length === 0 || items.length < BATCH_SIZE) break;
+    await sleep(DELAY_BETWEEN_PAGES_MS);
+  }
+  return rows;
+}
+
+/**
  * ================= DB HELPERS =================
  */
-
 async function insertChunked(table, rows) {
   if (!rows.length) return;
-
   const chunks = chunkArray(rows, CHUNK_SIZE);
   log(`INSERT ${table}: ${rows.length} rows (${chunks.length} chunks)`);
-
   for (const chunk of chunks) {
     const { error } = await supabase.from(table).insert(chunk);
     if (error) throw error;
@@ -324,11 +130,9 @@ async function insertChunked(table, rows) {
 
 async function upsertPages(rows) {
   if (!rows.length) return;
-
   const { error } = await supabase
     .from("steam_topsellers_pages_region")
     .upsert(rows, { onConflict: "cc" });
-
   if (error) throw error;
 }
 
@@ -337,71 +141,24 @@ async function clearCurrentRegion(cc) {
     .from("steam_topsellers_current_region")
     .delete()
     .eq("cc", cc);
-
   if (error) throw error;
 }
 
 /**
- * ================= SCRAPER =================
+ * Зібрати дані по одному регіону (API замість скрапінгу)
  */
-
-async function scrapePage({ cc, page }) {
-  const url = `${BASE_URL}&filter=topsellers&cc=${cc}&page=${page}`;
-
-  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-    try {
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), TIMEOUT_MS);
-
-      const res = await fetch(url, {
-        signal: controller.signal,
-        headers: { "User-Agent": "Mozilla/5.0" },
-      });
-
-      clearTimeout(timeout);
-      if (!res.ok) throw new Error();
-
-      const $ = cheerio.load(await res.text());
-      const rows = [];
-
-      $(".search_result_row").each((_, el) => {
-        const appid = extractAppId($(el).attr("href"));
-        if (appid) rows.push({ appid });
-      });
-
-      return rows;
-    } catch {
-      if (attempt === MAX_ATTEMPTS) return [];
-      await sleep(3000);
-    }
-  }
-}
-
-/**
- * ================= REGION SCRAPE =================
- */
-
 async function runRegion({ cc, ts }) {
-  let rows = [];
-  let rank = 1;
-
-  for (let page = 1; page <= MAX_PAGES; page++) {
-    const pageRows = await scrapePage({ cc, page });
-    if (!pageRows.length) break;
-
-    for (const r of pageRows) {
-      rows.push({ appid: r.appid, cc, rank: rank++, ts });
-    }
-
-    await sleep(PAGE_DELAY_MS);
+  log(`Fetch ${cc} via Query API...`);
+  const rows = await fetchRegionViaQuery(cc);
+  if (rows.length < MIN_VALID_ITEMS_REGION) {
+    log(`Skip ${cc}: too few items (${rows.length})`);
+    return null;
   }
 
   const unique = [...new Map(rows.map((r) => [r.appid, r])).values()];
 
-  if (unique.length < MIN_VALID_ITEMS_REGION) return null;
-
   return {
-    history: rows,
+    history: rows.map((r) => ({ appid: r.appid, cc, rank: r.rank, ts })),
     unique,
     current: unique.map((r, i) => ({
       cc,
@@ -409,14 +166,13 @@ async function runRegion({ cc, ts }) {
       rank: i + 1,
       updated_ts: ts,
     })),
-    totalPages: Math.ceil(unique.length / FRONT_PAGE_SIZE),
+    totalPages: Math.ceil(unique.length / 10),
   };
 }
 
 /**
  * ================= SNAPSHOT =================
  */
-
 async function runSnapshot() {
   const ts = Math.floor(Date.now() / 1000);
   const { idx, ccs } = getRegionGroup();
@@ -427,91 +183,84 @@ async function runSnapshot() {
   let pages = [];
 
   for (const cc of ccs) {
-    const res = await runRegion({ cc, ts });
-    if (!res) continue;
+    try {
+      const res = await runRegion({ cc, ts });
+      if (!res) continue;
 
-    history.push(...res.history);
+      history.push(...res.history);
 
-    await clearCurrentRegion(cc);
-    await insertChunked("steam_topsellers_current_region", res.current);
+      await clearCurrentRegion(cc);
+      await insertChunked("steam_topsellers_current_region", res.current);
 
-    pages.push({
-      cc,
-      total_pages: res.totalPages,
-      updated_ts: ts,
-    });
+      pages.push({
+        cc,
+        total_pages: res.totalPages,
+        updated_ts: ts,
+      });
 
-    /**
-     * ================= HOURLY (FIXED) =================
-     */
-
-    const hourly = res.unique.map((r, i) => ({
-      cc,
-      appid: r.appid,
-      ts,
-      rank: i + 1,
-    }));
-
-    for (let i = 0; i < hourly.length; i += 1000) {
-      await supabase
-        .from("steam_app_topsellers_hourly_region") // ✅ FIX
-        .upsert(hourly.slice(i, i + 1000), {
-          onConflict: "cc,appid,ts",
-          ignoreDuplicates: true,
-        });
-    }
-
-    await supabase
-      .from("steam_app_topsellers_hourly_region") // ✅ FIX
-      .delete()
-      .eq("cc", cc)
-      .lt("ts", ts - 48 * 3600);
-
-    /**
-     * ================= STATS =================
-     */
-
-    const appids = hourly.map((r) => r.appid);
-    const prevMap = new Map();
-
-    for (let i = 0; i < appids.length; i += 1000) {
-      const { data } = await supabase
-        .from("steam_app_topsellers_stats_region")
-        .select("*")
-        .eq("cc", cc)
-        .in("appid", appids.slice(i, i + 1000));
-
-      for (const r of data || []) prevMap.set(r.appid, r);
-    }
-
-    const stats = hourly.map((r) => {
-      const prev = prevMap.get(r.appid);
-
-      let bestAll = prev?.best_all_time_rank ?? r.rank;
-      let bestAllTs = prev?.best_all_time_rank_ts ?? ts;
-
-      if (r.rank < bestAll) {
-        bestAll = r.rank;
-        bestAllTs = ts;
-      }
-
-      return {
+      const hourly = res.unique.map((r, i) => ({
         cc,
         appid: r.appid,
-        rank_now: r.rank,
-        best_24h_rank: r.rank,
-        best_24h_rank_ts: ts,
-        best_all_time_rank: bestAll,
-        best_all_time_rank_ts: bestAllTs,
-        updated_ts: ts,
-      };
-    });
+        ts,
+        rank: i + 1,
+      }));
 
-    for (let i = 0; i < stats.length; i += 1000) {
+      for (let i = 0; i < hourly.length; i += 1000) {
+        await supabase
+          .from("steam_app_topsellers_hourly_region")
+          .upsert(hourly.slice(i, i + 1000), {
+            onConflict: "cc,appid,ts",
+            ignoreDuplicates: true,
+          });
+      }
+
       await supabase
-        .from("steam_app_topsellers_stats_region")
-        .upsert(stats.slice(i, i + 1000), { onConflict: "cc,appid" });
+        .from("steam_app_topsellers_hourly_region")
+        .delete()
+        .eq("cc", cc)
+        .lt("ts", ts - 48 * 3600);
+
+      const appids = hourly.map((r) => r.appid);
+      const prevMap = new Map();
+      for (let i = 0; i < appids.length; i += 1000) {
+        const { data } = await supabase
+          .from("steam_app_topsellers_stats_region")
+          .select("*")
+          .eq("cc", cc)
+          .in("appid", appids.slice(i, i + 1000));
+        for (const r of data || []) prevMap.set(r.appid, r);
+      }
+
+      const stats = hourly.map((r) => {
+        const prev = prevMap.get(r.appid);
+        let bestAll = prev?.best_all_time_rank ?? r.rank;
+        let bestAllTs = prev?.best_all_time_rank_ts ?? ts;
+        if (r.rank < bestAll) {
+          bestAll = r.rank;
+          bestAllTs = ts;
+        }
+        return {
+          cc,
+          appid: r.appid,
+          rank_now: r.rank,
+          best_24h_rank: r.rank,
+          best_24h_rank_ts: ts,
+          best_all_time_rank: bestAll,
+          best_all_time_rank_ts: bestAllTs,
+          updated_ts: ts,
+        };
+      });
+
+      for (let i = 0; i < stats.length; i += 1000) {
+        await supabase
+          .from("steam_app_topsellers_stats_region")
+          .upsert(stats.slice(i, i + 1000), { onConflict: "cc,appid" });
+      }
+    } catch (e) {
+      log(`Region ${cc} failed: ${e?.message ?? e}`);
     }
+
+    await sleep(DELAY_BETWEEN_REGIONS_MS);
   }
 
   if (history.length) {
@@ -523,39 +272,27 @@ async function runSnapshot() {
 }
 
 /**
- * ================= LOOP =================
+ * ================= MAIN =================
  */
-
 async function main() {
-  await refreshSteamSession();
-  await injectCookies();
-
-  setTimeout(() => {
-    const runRefresh = async () => {
-      try {
-        if (await refreshSteamSession()) {
-          await injectCookies();
-        }
-      } catch (e) {
-        log(`Steam session refresh interval error: ${e?.message || e}`);
-      }
-    };
-    runRefresh();
-    setInterval(runRefresh, STEAM_REFRESH_INTERVAL_MS);
-  }, STEAM_REFRESH_OFFSET_MS);
+  if (!STEAM_KEY) {
+    console.error("Missing STEAM_KEY");
+    process.exit(1);
+  }
 
   while (true) {
     const now = new Date();
     const next = new Date(now);
     next.setUTCMinutes(Math.ceil(now.getUTCMinutes() / 10) * 10);
     next.setUTCSeconds(0);
-
-    await sleep(next - now);
+    const wait = next - now;
+    log(`Next run at ${next.toISOString()} (in ${Math.round(wait / 1000)}s)`);
+    await sleep(wait);
 
     try {
       await runSnapshot();
-    } catch {
-      log("❌ SNAPSHOT FAILED");
+    } catch (e) {
+      log("❌ SNAPSHOT FAILED: " + (e?.message ?? e));
     }
   }
 }
