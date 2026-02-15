@@ -3,7 +3,11 @@ import fetchCookie from "fetch-cookie";
 import { CookieJar } from "tough-cookie";
 import * as cheerio from "cheerio";
 import { createClient } from "@supabase/supabase-js";
-import { LoginSession, EAuthSessionGuardType, EAuthTokenPlatformType } from "steam-session";
+import {
+  LoginSession,
+  EAuthSessionGuardType,
+  EAuthTokenPlatformType,
+} from "steam-session";
 import { generateAuthCode } from "steam-totp";
 import "dotenv/config";
 
@@ -49,7 +53,7 @@ const supabase = createClient(
   {
     db: { schema: "analytics" },
     auth: { persistSession: false },
-  }
+  },
 );
 
 /**
@@ -65,27 +69,90 @@ let lastRefreshToken = null;
 const STEAM_CREDENTIALS = {
   username: process.env.STEAM_USERNAME || "jastle87",
   password: process.env.STEAM_PASSWORD || "Nfhfcxbhrjd1",
-  sharedSecret: process.env.STEAM_SHARED_SECRET || "WUnt7AtHEoU542Q6gd3GarI6Zho=",
+  sharedSecret:
+    process.env.STEAM_SHARED_SECRET || "WUnt7AtHEoU542Q6gd3GarI6Zho=",
 };
 
 const STEAM_COOKIES_BASE = [
-  { domain: "store.steampowered.com", name: "timezoneOffset", path: "/", secure: false, httpOnly: false, sameSite: "unspecified", value: "7200,0" },
-  { domain: "store.steampowered.com", name: "bGameHighlightAudioEnabled", path: "/", secure: false, httpOnly: false, sameSite: "unspecified", value: "true" },
-  { domain: "store.steampowered.com", name: "Steam_Language", path: "/", secure: true, httpOnly: false, sameSite: "no_restriction", value: "english" },
-  { domain: "store.steampowered.com", name: "timezoneName", path: "/", secure: true, httpOnly: false, sameSite: "no_restriction", value: "Europe/Kiev" },
-  { domain: "store.steampowered.com", name: "browserid", path: "/", secure: true, httpOnly: false, sameSite: "no_restriction", value: "409394601280791133" },
-  { domain: "store.steampowered.com", name: "lastagecheckage", path: "/", secure: true, httpOnly: false, sameSite: "lax", value: "1-January-1970" },
-  { domain: "store.steampowered.com", name: "birthtime", path: "/", secure: true, httpOnly: false, sameSite: "lax", value: "1" },
-  { domain: "store.steampowered.com", name: "flGameHighlightPlayerVolume", path: "/", secure: false, httpOnly: false, sameSite: "unspecified", value: "10" },
-  { domain: "store.steampowered.com", name: "steamLoginSecure", path: "/", secure: true, httpOnly: true, sameSite: "no_restriction", value: null },
-  { domain: "store.steampowered.com", name: "sessionid", path: "/", secure: true, httpOnly: false, sameSite: "no_restriction", value: "fe6dec188564bf91f833f57d" },
-  { domain: "store.steampowered.com", name: "steamCountry", path: "/", secure: true, httpOnly: true, sameSite: "no_restriction", value: "UA%7Cdcc52d0e2cd49e8d2b7a84ba6b93b099" },
-  { domain: "store.steampowered.com", name: "recentapps", path: "/", secure: true, httpOnly: false, sameSite: "no_restriction", value: "%7B%221997410%22%3A1770916863%2C%223101040%22%3A1770916792%2C%221290000%22%3A1770916788%2C%22552990%22%3A1770916473%2C%222357570%22%3A1770904338%2C%222358720%22%3A1770740184%2C%22686060%22%3A1770740031%2C%22652150%22%3A1770718138%2C%222432860%22%3A1770717774%2C%22730%22%3A1770635331%7D" },
+  {
+    domain: "store.steampowered.com",
+    name: "bGameHighlightAudioEnabled",
+    path: "/",
+    secure: false,
+    httpOnly: false,
+    sameSite: "unspecified",
+    value: "true",
+  },
+  {
+    domain: "store.steampowered.com",
+    name: "Steam_Language",
+    path: "/",
+    secure: true,
+    httpOnly: false,
+    sameSite: "no_restriction",
+    value: "english",
+  },
+  {
+    domain: "store.steampowered.com",
+    name: "browserid",
+    path: "/",
+    secure: true,
+    httpOnly: false,
+    sameSite: "no_restriction",
+    value: "409394601280791133",
+  },
+  {
+    domain: "store.steampowered.com",
+    name: "lastagecheckage",
+    path: "/",
+    secure: true,
+    httpOnly: false,
+    sameSite: "lax",
+    value: "1-January-1970",
+  },
+  {
+    domain: "store.steampowered.com",
+    name: "birthtime",
+    path: "/",
+    secure: true,
+    httpOnly: false,
+    sameSite: "lax",
+    value: "1",
+  },
+  {
+    domain: "store.steampowered.com",
+    name: "flGameHighlightPlayerVolume",
+    path: "/",
+    secure: false,
+    httpOnly: false,
+    sameSite: "unspecified",
+    value: "10",
+  },
+  {
+    domain: "store.steampowered.com",
+    name: "steamLoginSecure",
+    path: "/",
+    secure: true,
+    httpOnly: true,
+    sameSite: "no_restriction",
+    value: null,
+  },
+  {
+    domain: "store.steampowered.com",
+    name: "sessionid",
+    path: "/",
+    secure: true,
+    httpOnly: false,
+    sameSite: "no_restriction",
+    value: "fe6dec188564bf91f833f57d",
+  },
 ];
 
 function getSteamCookies() {
   return STEAM_COOKIES_BASE.map((c) =>
-    c.name === "steamLoginSecure" ? { ...c, value: currentSteamLoginSecure } : c
+    c.name === "steamLoginSecure"
+      ? { ...c, value: currentSteamLoginSecure }
+      : c,
   );
 }
 
@@ -95,7 +162,8 @@ function toCookieString(c) {
   let s = `${c.name}=${c.value}; Domain=${domain}; Path=${path}`;
   if (c.secure) s += "; Secure";
   if (c.httpOnly) s += "; HttpOnly";
-  if (c.sameSite && c.sameSite !== "unspecified") s += `; SameSite=${c.sameSite}`;
+  if (c.sameSite && c.sameSite !== "unspecified")
+    s += `; SameSite=${c.sameSite}`;
   return s;
 }
 
@@ -152,8 +220,15 @@ function parseSteamLoginSecureFromCookies(cookieStrings) {
 async function refreshSteamSession() {
   const { username: accountName, password, sharedSecret } = STEAM_CREDENTIALS;
 
-  if (!accountName || !password || !sharedSecret || password === "ADD_YOUR_PASSWORD_HERE") {
-    log("Steam auto-refresh skipped: STEAM_USERNAME, STEAM_PASSWORD, STEAM_SHARED_SECRET not set");
+  if (
+    !accountName ||
+    !password ||
+    !sharedSecret ||
+    password === "ADD_YOUR_PASSWORD_HERE"
+  ) {
+    log(
+      "Steam auto-refresh skipped: STEAM_USERNAME, STEAM_PASSWORD, STEAM_SHARED_SECRET not set",
+    );
     return false;
   }
 
@@ -189,7 +264,12 @@ async function refreshSteamSession() {
       steamGuardCode,
     });
 
-    if (startResult.actionRequired && startResult.validActions?.some((a) => a.type === EAuthSessionGuardType.DeviceCode)) {
+    if (
+      startResult.actionRequired &&
+      startResult.validActions?.some(
+        (a) => a.type === EAuthSessionGuardType.DeviceCode,
+      )
+    ) {
       try {
         const code = generateAuthCode(sharedSecret);
         await session.submitSteamGuardCode(code);
