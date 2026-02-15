@@ -56,6 +56,7 @@ function chunkArray(arr, size) {
 
 /**
  * 🕒 GROUP BY UTC MINUTES — яка група країн зараз
+ * :00 → 0, :10 → 1, :20 → 2, :30 → 3, :40 → 4, :50 → 0 (група 0 ще раз)
  */
 function getRegionGroup() {
   const m = new Date().getUTCMinutes();
@@ -155,7 +156,11 @@ async function runRegion({ cc, ts }) {
     return null;
   }
 
-  const unique = [...new Map(rows.map((r) => [r.appid, r])).values()];
+  const uniqueByAppid = new Map();
+  for (const r of rows) {
+    if (!uniqueByAppid.has(r.appid)) uniqueByAppid.set(r.appid, r);
+  }
+  const unique = [...uniqueByAppid.values()];
 
   return {
     history: rows.map((r) => ({ appid: r.appid, cc, rank: r.rank, ts })),
