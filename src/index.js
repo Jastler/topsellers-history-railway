@@ -248,7 +248,7 @@ async function runSnapshot() {
       try {
         await writeRegionToDb(cc, ts, res);
         history.push(...res.history);
-        pages.push(...res.pages);
+        pages.push({ cc, total_pages: res.totalPages, updated_ts: ts });
       } catch (e) {
         log(`Region ${cc} DB write failed: ${e?.message ?? e}`);
       }
