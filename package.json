@@ -7,6 +7,7 @@
   "scripts": {
     "start": "node src/index.js",
     "dev": "nodemon src/index.js",
+    "compare-regions": "node scripts/compare-regions.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": ["railway", "nodejs", "supabase"],
