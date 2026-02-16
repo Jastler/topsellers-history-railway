@@ -9,7 +9,7 @@ const BATCH_SIZE = 1000;
 const TOTAL_PER_REGION = 10000;
 const DELAY_BETWEEN_PAGES_MS = 10000;
 
-const CHUNK_SIZE = 500;
+const CHUNK_SIZE = 1000;
 const MIN_VALID_ITEMS_REGION = 500;
 
 const REGION_GROUPS = [
@@ -144,80 +144,70 @@ async function runRegion({ cc, ts }) {
   };
 }
 
-async function processRegion(cc, ts) {
-  try {
-    const res = await runRegion({ cc, ts });
-    if (!res) return null;
+async function writeRegionToDb(cc, ts, res) {
+  await clearCurrentRegion(cc);
+  await insertChunked("steam_topsellers_current_region", res.current);
 
-    await clearCurrentRegion(cc);
-    await insertChunked("steam_topsellers_current_region", res.current);
+  const hourly = res.unique.map((r, i) => ({
+    cc,
+    appid: r.appid,
+    ts,
+    rank: i + 1,
+  }));
 
-    const hourly = res.unique.map((r, i) => ({
+  for (let i = 0; i < hourly.length; i += 1000) {
+    const { error } = await supabase
+      .from("steam_app_topsellers_hourly_region")
+      .upsert(hourly.slice(i, i + 1000), {
+        onConflict: "cc,appid,ts",
+        ignoreDuplicates: true,
+      });
+    if (error) throw error;
+  }
+
+  const { error: delErr } = await supabase
+    .from("steam_app_topsellers_hourly_region")
+    .delete()
+    .eq("cc", cc)
+    .lt("ts", ts - 48 * 3600);
+  if (delErr) throw delErr;
+
+  const appids = hourly.map((r) => r.appid);
+  const prevMap = new Map();
+  for (let i = 0; i < appids.length; i += 1000) {
+    const { data } = await supabase
+      .from("steam_app_topsellers_stats_region")
+      .select("*")
+      .eq("cc", cc)
+      .in("appid", appids.slice(i, i + 1000));
+    for (const r of data || []) prevMap.set(r.appid, r);
+  }
+
+  const stats = hourly.map((r) => {
+    const prev = prevMap.get(r.appid);
+    let bestAll = prev?.best_all_time_rank ?? r.rank;
+    let bestAllTs = prev?.best_all_time_rank_ts ?? ts;
+    if (r.rank < bestAll) {
+      bestAll = r.rank;
+      bestAllTs = ts;
+    }
+    return {
       cc,
       appid: r.appid,
-      ts,
-      rank: i + 1,
-    }));
-
-    for (let i = 0; i < hourly.length; i += 1000) {
-      await supabase
-        .from("steam_app_topsellers_hourly_region")
-        .upsert(hourly.slice(i, i + 1000), {
-          onConflict: "cc,appid,ts",
-          ignoreDuplicates: true,
-        });
-    }
-
-    await supabase
-      .from("steam_app_topsellers_hourly_region")
-      .delete()
-      .eq("cc", cc)
-      .lt("ts", ts - 48 * 3600);
-
-    const appids = hourly.map((r) => r.appid);
-    const prevMap = new Map();
-    for (let i = 0; i < appids.length; i += 1000) {
-      const { data } = await supabase
-        .from("steam_app_topsellers_stats_region")
-        .select("*")
-        .eq("cc", cc)
-        .in("appid", appids.slice(i, i + 1000));
-      for (const r of data || []) prevMap.set(r.appid, r);
-    }
-
-    const stats = hourly.map((r) => {
-      const prev = prevMap.get(r.appid);
-      let bestAll = prev?.best_all_time_rank ?? r.rank;
-      let bestAllTs = prev?.best_all_time_rank_ts ?? ts;
-      if (r.rank < bestAll) {
-        bestAll = r.rank;
-        bestAllTs = ts;
-      }
-      return {
-        cc,
-        appid: r.appid,
-        rank_now: r.rank,
-        best_24h_rank: r.rank,
-        best_24h_rank_ts: ts,
-        best_all_time_rank: bestAll,
-        best_all_time_rank_ts: bestAllTs,
-        updated_ts: ts,
-      };
-    });
-
-    for (let i = 0; i < stats.length; i += 1000) {
-      await supabase
-        .from("steam_app_topsellers_stats_region")
-        .upsert(stats.slice(i, i + 1000), { onConflict: "cc,appid" });
-    }
-
-    return {
-      history: res.history,
-      pages: [{ cc, total_pages: res.totalPages, updated_ts: ts }],
+      rank_now: r.rank,
+      best_24h_rank: r.rank,
+      best_24h_rank_ts: ts,
+      best_all_time_rank: bestAll,
+      best_all_time_rank_ts: bestAllTs,
+      updated_ts: ts,
     };
-  } catch (e) {
-    log(`Region ${cc} failed: ${e?.message ?? e}`);
-    return null;
+  });
+
+  for (let i = 0; i < stats.length; i += 1000) {
+    const { error } = await supabase
+      .from("steam_app_topsellers_stats_region")
+      .upsert(stats.slice(i, i + 1000), { onConflict: "cc,appid" });
+    if (error) throw error;
   }
 }
 
@@ -241,16 +231,29 @@ async function runSnapshot() {
   const ts = getSnapshotTs();
   const ccs = ALL_CC;
 
-  log(`===== SNAPSHOT START ts=${ts} | ${ccs.length} regions in parallel =====`);
+  log(`===== SNAPSHOT START ts=${ts} | fetch ${ccs.length} regions in parallel, then write DB sequentially =====`);
 
-  const results = await Promise.all(ccs.map((cc) => processRegion(cc, ts)));
+  const fetchResults = await Promise.allSettled(
+    ccs.map((cc) => runRegion({ cc, ts }))
+  );
 
   let history = [];
   let pages = [];
-  for (const r of results) {
-    if (r) {
-      history.push(...r.history);
-      pages.push(...r.pages);
+  for (let i = 0; i < ccs.length; i++) {
+    const cc = ccs[i];
+    const settled = fetchResults[i];
+    const res =
+      settled.status === "fulfilled" ? settled.value : null;
+    if (res) {
+      try {
+        await writeRegionToDb(cc, ts, res);
+        history.push(...res.history);
+        pages.push(...res.pages);
+      } catch (e) {
+        log(`Region ${cc} DB write failed: ${e?.message ?? e}`);
+      }
+    } else {
+      log(`Region ${cc} fetch failed: ${settled.reason?.message ?? settled.reason}`);
     }
   }
 
