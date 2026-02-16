@@ -2,13 +2,6 @@ import fetch from "node-fetch";
 import { createClient } from "@supabase/supabase-js";
 import "dotenv/config";
 
-/**
- * ================= CONFIG =================
- * Top sellers по регіонах через IStoreQueryService/Query.
- * Коли й які країни — REGION_GROUPS (ротація кожні 10 хв).
- * Запис у БД — як раніше (history, current, pages, hourly, stats).
- */
-
 const STEAM_KEY = process.env.STEAM_KEY;
 const API_BASE = "https://api.steampowered.com/IStoreQueryService/Query/v1/";
 
@@ -20,15 +13,12 @@ const DELAY_BETWEEN_REGIONS_MS = 600;
 const CHUNK_SIZE = 500;
 const MIN_VALID_ITEMS_REGION = 500;
 
-/**
- * 🔁 REGION ROTATION GROUPS (10 хв / група)
- */
 const REGION_GROUPS = [
-  ["us", "gb", "de", "fr", "pl", "ru"],
-  ["uk", "tr", "es", "it", "nl", "th"],
-  ["ca", "au", "jp", "kr", "br", "nz"],
-  ["se", "dk", "no", "fi", "ch", "tw"],
-  ["at", "be", "cz", "hk", "sg"],
+  ["at", "au", "be", "br", "ca", "ch"],
+  ["cn", "cz", "de", "dk", "es", "fi"],
+  ["fr", "gb", "hk", "it", "jp", "kr"],
+  ["nl", "no", "nz", "pl", "ru", "se"],
+  ["sg", "th", "tr", "tw", "us"],
 ];
 
 const supabase = createClient(
@@ -54,26 +44,19 @@ function chunkArray(arr, size) {
   return out;
 }
 
-/**
- * 🕒 GROUP BY UTC MINUTES — яка група країн зараз
- * :00 → 0, :10 → 1, :20 → 2, :30 → 3, :40 → 4, :50 → 0 (група 0 ще раз)
- */
 function getRegionGroup() {
   const m = new Date().getUTCMinutes();
   const idx = Math.floor(m / 10) % REGION_GROUPS.length;
   return { idx, ccs: REGION_GROUPS[idx] };
 }
 
-/**
- * Один запит до Query API (одна сторінка пагінації)
- */
 function buildInput(cc, start) {
   return {
     query: {
       start,
       count: BATCH_SIZE,
       sort: 11,
-      filters: { global_top_n_sellers: TOTAL_PER_REGION },
+      filters: { regional_top_n_sellers: TOTAL_PER_REGION },
     },
     context: { language: "en", country_code: cc.toUpperCase() },
     data_request: { include_basic_info: true },
@@ -97,9 +80,6 @@ async function fetchStoreQueryPage(input) {
   return JSON.parse(text);
 }
 
-/**
- * Завантажити топ по регіону через Query API (з пагінацією)
- */
 async function fetchRegionViaQuery(cc) {
   const rows = [];
   for (let start = 0; start < TOTAL_PER_REGION; start += BATCH_SIZE) {
@@ -116,9 +96,6 @@ async function fetchRegionViaQuery(cc) {
   return rows;
 }
 
-/**
- * ================= DB HELPERS =================
- */
 async function insertChunked(table, rows) {
   if (!rows.length) return;
   const chunks = chunkArray(rows, CHUNK_SIZE);
@@ -145,9 +122,6 @@ async function clearCurrentRegion(cc) {
   if (error) throw error;
 }
 
-/**
- * Зібрати дані по одному регіону (API замість скрапінгу)
- */
 async function runRegion({ cc, ts }) {
   log(`Fetch ${cc} via Query API...`);
   const rows = await fetchRegionViaQuery(cc);
@@ -175,9 +149,6 @@ async function runRegion({ cc, ts }) {
   };
 }
 
-/**
- * ================= SNAPSHOT =================
- */
 async function runSnapshot() {
   const ts = Math.floor(Date.now() / 1000);
   const { idx, ccs } = getRegionGroup();
@@ -276,9 +247,6 @@ async function runSnapshot() {
   log(`===== SNAPSHOT DONE ts=${ts} =====`);
 }
 
-/**
- * ================= MAIN =================
- */
 async function main() {
   if (!STEAM_KEY) {
     console.error("Missing STEAM_KEY");
