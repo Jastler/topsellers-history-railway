@@ -9,7 +9,8 @@ const BATCH_SIZE = 1000;
 const TOTAL_PER_REGION = 10000;
 const DELAY_BETWEEN_PAGES_MS = 10000;
 
-const CHUNK_SIZE = 1000;
+const CHUNK_SIZE = 2000;
+const CHUNK_DELAY_MS = 50;
 const MIN_VALID_ITEMS_REGION = 500;
 
 const REGION_GROUPS = [
@@ -95,9 +96,10 @@ async function insertChunked(table, rows) {
   if (!rows.length) return;
   const chunks = chunkArray(rows, CHUNK_SIZE);
   log(`INSERT ${table}: ${rows.length} rows (${chunks.length} chunks)`);
-  for (const chunk of chunks) {
-    const { error } = await supabase.from(table).insert(chunk);
+  for (let i = 0; i < chunks.length; i++) {
+    const { error } = await supabase.from(table).insert(chunks[i]);
     if (error) throw error;
+    if (i < chunks.length - 1 && CHUNK_DELAY_MS > 0) await sleep(CHUNK_DELAY_MS);
   }
 }
 
@@ -155,14 +157,15 @@ async function writeRegionToDb(cc, ts, res) {
     rank: i + 1,
   }));
 
-  for (let i = 0; i < hourly.length; i += 1000) {
+  for (let i = 0; i < hourly.length; i += CHUNK_SIZE) {
     const { error } = await supabase
       .from("steam_app_topsellers_hourly_region")
-      .upsert(hourly.slice(i, i + 1000), {
+      .upsert(hourly.slice(i, i + CHUNK_SIZE), {
         onConflict: "cc,appid,ts",
         ignoreDuplicates: true,
       });
     if (error) throw error;
+    if (i + CHUNK_SIZE < hourly.length && CHUNK_DELAY_MS > 0) await sleep(CHUNK_DELAY_MS);
   }
 
   const { error: delErr } = await supabase
@@ -174,12 +177,12 @@ async function writeRegionToDb(cc, ts, res) {
 
   const appids = hourly.map((r) => r.appid);
   const prevMap = new Map();
-  for (let i = 0; i < appids.length; i += 1000) {
+  for (let i = 0; i < appids.length; i += CHUNK_SIZE) {
     const { data } = await supabase
       .from("steam_app_topsellers_stats_region")
       .select("*")
       .eq("cc", cc)
-      .in("appid", appids.slice(i, i + 1000));
+      .in("appid", appids.slice(i, i + CHUNK_SIZE));
     for (const r of data || []) prevMap.set(r.appid, r);
   }
 
@@ -203,11 +206,12 @@ async function writeRegionToDb(cc, ts, res) {
     };
   });
 
-  for (let i = 0; i < stats.length; i += 1000) {
+  for (let i = 0; i < stats.length; i += CHUNK_SIZE) {
     const { error } = await supabase
       .from("steam_app_topsellers_stats_region")
-      .upsert(stats.slice(i, i + 1000), { onConflict: "cc,appid" });
+      .upsert(stats.slice(i, i + CHUNK_SIZE), { onConflict: "cc,appid" });
     if (error) throw error;
+    if (i + CHUNK_SIZE < stats.length && CHUNK_DELAY_MS > 0) await sleep(CHUNK_DELAY_MS);
   }
 }
 

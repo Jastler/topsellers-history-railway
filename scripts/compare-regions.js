@@ -188,6 +188,30 @@ async function main() {
         ),
       );
   }
+
+  const at = ok.find((x) => x.cc === "at");
+  const be = ok.find((x) => x.cc === "be");
+  if (at && be) {
+    const cmp = compareTwo("at", at.list, "be", be.list);
+    const byAppAt = new Map(at.list.map((r) => [r.appid, r.rank]));
+    const byAppBe = new Map(be.list.map((r) => [r.appid, r.rank]));
+    const shared = at.list.filter((r) => byAppBe.has(r.appid));
+    const withDelta = shared.map((r) => ({
+      appid: r.appid,
+      rankAt: r.rank,
+      rankBe: byAppBe.get(r.appid),
+      delta: byAppBe.get(r.appid) - r.rank,
+    }));
+    withDelta.sort((a, b) => Math.abs(b.delta) - Math.abs(a.delta));
+
+    console.log("\n--- AT (Австрія) vs BE (Бельгія) ---");
+    console.log(`  Overlap: ${cmp.overlap}/1000 (${cmp.overlapPct}%), only in AT: ${cmp.onlyA}, only in BE: ${cmp.onlyB}`);
+    console.log(`  Same order: ${cmp.sameOrder}, avg rank delta (Be - At): ${cmp.avgRankDelta}`);
+    console.log("  Top 15 by |rank difference| (appid | rank AT | rank BE | delta):");
+    withDelta.slice(0, 15).forEach((x) =>
+      console.log(`    ${x.appid}  |  ${x.rankAt}  |  ${x.rankBe}  |  ${x.delta > 0 ? "+" : ""}${x.delta}`),
+    );
+  }
 }
 
 main().catch((e) => {
